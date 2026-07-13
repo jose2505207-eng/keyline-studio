@@ -41,8 +41,10 @@ The app is live at
   overrides it at runtime (e.g. `?api=http://localhost:8000` to use a local
   backend).
 - **Backend**: Docker web service on Render's free tier at
-  https://keyline-backend.onrender.com, auto-deployed from this repo's
-  `render.yaml` blueprint on pushes to `main`. Vercel can't host it — the
+  https://keyline-backend.onrender.com, from this repo's `render.yaml`
+  blueprint. Pushes to `main` should auto-deploy; if Render's GitHub webhook
+  isn't installed for the repo (Syncs page shows no new syncs after a push),
+  use the service's **Manual Deploy → Deploy latest commit** button. Vercel can't host it — the
   pipeline needs the native WhiteboxTools binary, minutes-long jobs, and
   on-disk SQLite/rasters. Free-tier caveats: the instance spins down when
   idle (first request after a pause takes ~1 min), storage is ephemeral
@@ -72,8 +74,13 @@ Or with Docker: `docker compose up --build`, then open http://localhost:5173.
 
 ## Using it
 
+0. **Find your land** — search box (free Nominatim geocoding, explicit-submit
+   with a 1 s debounce per the OSM usage policy) or pan/zoom. Basemap is Esri
+   World Imagery satellite (keyless); switch to OSM streets with the radio
+   toggle.
 1. **Draw AOI** — click the button, click vertices on the map, click the first
-   point again to close the polygon (max 100 km²).
+   point again to close the polygon. A live area readout shows the polygon's
+   km² while you draw and turns red past the 100 km² backend cap.
 2. **Upload drone DEM** (optional) — any single-band GeoTIFF with a CRS.
 3. **Analyze** — progress panel shows each pipeline step (polled every 2 s).
 4. Toggle result layers: hillshade, valleys (blue), ridges (brown), keylines
@@ -120,7 +127,10 @@ keyline generation, asserted against a known slope break.
    (median/MAD); valleys with confidence < 0.3 emit no keypoint. At most one
    keypoint per valley.
 9. **Keylines** — `skimage.measure.find_contours` at the keypoint elevation;
-   the contour passing nearest the keypoint is kept and clipped to the AOI.
+   among the full contour components passing within a pixel of the nearest,
+   the longest is kept (so a tiny noise loop at the keypoint can't beat the
+   landform-following contour), lightly simplified (~half a pixel tolerance)
+   to suppress raster staircase, and clipped to the AOI.
 10. **Output** — everything reprojected back to WGS84 into one GeoJSON
     FeatureCollection (`kind`: valley | ridge | keypoint | keyline), plus a
     hillshade PNG with a world file and a WGS84 corner-coordinates sidecar
