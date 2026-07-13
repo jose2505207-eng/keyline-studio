@@ -1,0 +1,21 @@
+# Optional convenience — the app also runs bare with two dev servers
+# (see README). `docker compose up --build` then open http://localhost:5173
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/data:/app/data
+    environment:
+      - AWS_NO_SIGN_REQUEST=YES
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    environment:
+      # Vite dev proxy target inside the compose network
+      - VITE_PROXY_TARGET=http://backend:8000

@@ -1,0 +1,198 @@
+# Keyline Studio
+
+A free, non-commercial keyline-design planning tool. Draw an area of interest
+(AOI) on a map anywhere on Earth; the backend fetches Copernicus GLO-30
+satellite elevation data, runs a hydrological analysis pipeline, detects
+candidate **keypoints** (the slope break where a steeper upper valley meets the
+flatter lower valley), and generates **keylines** (the contour through each
+keypoint). Optionally upload a higher-resolution drone DEM (GeoTIFF) that
+overrides the satellite data within its footprint.
+
+> **Elevation data: Copernicus GLO-30 © DLR/Airbus, provided by the European
+> Union and ESA.** Candidate keypoints are computational suggestions — field
+> verification is required before any earthworks.
+
+## Layout
+
+```
+keyline/                  (this repo — the "keyline-studio" monorepo)
+  backend/                FastAPI app, analysis pipeline, tests
+    app/
+      main.py             API endpoints
+      db.py               SQLite project + job store
+      dem_source.py       GLO-30 tile math + COG windowed reads (anonymous S3)
+      hydrology.py        Whitebox / pysheds engine abstraction
+      terrain.py          stream vectorization, keypoints, keylines, hillshade
+      pipeline.py         orchestration: fetch → reproject → fuse → analyze
+      fusion.py           drone/satellite co-registration + feathered blend
+    tests/                offline synthetic tests (no network required)
+  frontend/               React + Vite + TypeScript + MapLibre GL + terra-draw
+  docker-compose.yml      optional convenience
+```
+
+## Running (bare, two dev servers)
+
+Backend (Python 3.11+; developed on 3.12):
+
+```bash
+cd backend
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/uvicorn app.main:app --port 8000
+```
+
+Frontend:
+
+```bash
+cd frontend
+npm install
+npm run dev          # http://localhost:5173 (proxies /api to :8000)
+```
+
+Or with Docker: `docker compose up --build`, then open http://localhost:5173.
+
+## Using it
+
+1. **Draw AOI** — click the button, click vertices on the map, click the first
+   point again to close the polygon (max 100 km²).
+2. **Upload drone DEM** (optional) — any single-band GeoTIFF with a CRS.
+3. **Analyze** — progress panel shows each pipeline step (polled every 2 s).
+4. Toggle result layers: hillshade, valleys (blue), ridges (brown), keylines
+   (bold green), keypoints (solid circle = drone-derived, hollow = satellite;
+   size/opacity scale with confidence; click for elevation/confidence/source).
+5. **Drag a keypoint** to move it — its keyline is recomputed server-side as
+   the contour at the DEM elevation under the new position.
+6. **Export GeoJSON** — downloads the current (post-edit) FeatureCollection,
+   openable in QGIS.
+
+## Tests
+
+```bash
+cd backend && .venv/bin/python -m pytest tests/
+```
+
+All tests are offline: GLO-30 tile-name math (all four hemisphere quadrants),
+drone/satellite fusion (offset removal + seam monotonicity), and an
+end-to-end synthetic-DEM run through valley extraction → keypoint detection →
+keyline generation, asserted against a known slope break.
+
+## How it works
+
+1. **Fetch** — GLO-30 tiles are Cloud-Optimized GeoTIFFs on the public
+   `s3://copernicus-dem-30m/` bucket (anonymous access, no API key). Only the
+   window covering the AOI bbox — padded 10% to avoid edge artifacts in flow
+   routing — is read; multi-tile bboxes are mosaicked in memory.
+2. **Reproject** to the local UTM zone, auto-selected from the AOI centroid
+   (`geopandas.estimate_utm_crs`); works in both hemispheres.
+3. **Fuse drone DEM** (if provided) — see “Fusion details” below.
+4. **Condition** — depressions are breached/filled (Whitebox
+   `BreachDepressionsLeastCost`, or pysheds fill_pits/fill_depressions/
+   resolve_flats).
+5. **Flow routing** — D8 flow direction + accumulation.
+6. **Valleys** — cells with accumulation > 1% of max (tunable) are thinned to
+   a skeleton and traced into polylines split at junctions, each oriented
+   downstream→upstream.
+7. **Ridges** — same procedure on the inverted DEM.
+8. **Keypoints** — for each valley ≥ 150 m: sample the DEM along the line at
+   ~1-pixel spacing, smooth with Savitzky–Golay, take the second derivative
+   of elevation vs. along-line distance, and pick the point of maximum
+   concavity (the slope break). Confidence ∈ [0,1] is a clipped robust
+   z-score of the curvature peak against the profile's curvature noise
+   (median/MAD); valleys with confidence < 0.3 emit no keypoint. At most one
+   keypoint per valley.
+9. **Keylines** — `skimage.measure.find_contours` at the keypoint elevation;
+   the contour passing nearest the keypoint is kept and clipped to the AOI.
+10. **Output** — everything reprojected back to WGS84 into one GeoJSON
+    FeatureCollection (`kind`: valley | ridge | keypoint | keyline), plus a
+    hillshade PNG with a world file and a WGS84 corner-coordinates sidecar
+    for the MapLibre image overlay.
+
+Jobs run as FastAPI `BackgroundTasks`; states
+(`queued | running:<step> | done | error:<message>`) and a step log persist in
+SQLite (`backend/data/keyline.sqlite`). No Redis/Celery.
+
+### Hydrology engines
+
+`backend/app/hydrology.py` exposes one interface with two engines:
+
+- **WhiteboxTools** (preferred): the `whitebox` pip package downloads its
+  native binary on first init. In this environment the download succeeded, so
+  Whitebox is the default engine at runtime.
+- **pysheds** (fallback): pure Python/numba. Used automatically if the
+  Whitebox binary is unavailable, and **forced in the test suite**
+  (`KEYLINE_HYDRO_ENGINE=pysheds` in `tests/conftest.py`) so tests never
+  depend on the binary download. Force an engine with
+  `KEYLINE_HYDRO_ENGINE=whitebox|pysheds`.
+
+### Fusion details
+
+- The drone raster is reprojected onto the analysis grid (bilinear).
+- **Vertical co-registration**: the mean elevation offset drone−satellite over
+  the overlap is subtracted from the drone patch. *Simplification*: this
+  absorbs the vertical-datum difference (drone heights are often ellipsoidal,
+  GLO-30 is EGM2008 geoid) plus GNSS bias in one constant; a proper datum
+  transformation is a future enhancement.
+- **Priority replacement with feathering**: drone values win inside the drone
+  footprint; across a ~90 m band (≈3 GLO-30 pixels) inside the footprint edge
+  the two surfaces are linearly blended so no artificial cliff is created.
+  Satellite data outside the footprint is untouched.
+- The whole AOI is analyzed on a single grid at the drone resolution
+  (satellite part bilinear-upsampled), accepting the memory cost but capped
+  at 25 M cells — beyond that the resolution is coarsened to fit.
+- A keypoint's `source` property is `"drone"` when it falls where the fused
+  surface is predominantly drone-derived (blend weight > 0.5), else
+  `"satellite"`.
+
+## API
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/projects` | `{name, aoi}` → `{project_id}` (accepts a Polygon geometry or Feature) |
+| `POST /api/projects/{id}/drone-dem` | multipart GeoTIFF upload (validated: single-band, has CRS) |
+| `POST /api/projects/{id}/analyze` | enqueue pipeline → `{job_id}` |
+| `GET /api/projects/{id}/status` | `{state, log}` |
+| `GET /api/projects/{id}/results` | result GeoJSON FeatureCollection |
+| `GET /api/projects/{id}/hillshade` | hillshade PNG (bounds in `X-Bounds` header) |
+| `GET /api/projects/{id}/hillshade-bounds` | WGS84 corner coordinates (JSON) |
+| `POST /api/projects/{id}/keypoints/{kid}/move` | `{lng, lat}` → recomputes that keypoint's keyline only |
+
+## Decisions & deviations from the spec
+
+- **Repo root** is `keyline/` (the directory this was built in) rather than
+  `keyline-studio/`; the internal layout matches the spec.
+- **Keypoint sign convention**: the spec describes the keypoint as the "most
+  negative second derivative moving downstream". For a profile that flattens
+  downstream, the slope break is actually a *positive* extremum of d²z/ds²
+  in either traversal direction (slope magnitude decreases downstream ⇒ the
+  profile is concave-up at the break). We detect the maximum of d²z/ds² on
+  the downstream→upstream profile — the same physical point.
+- **Confidence score**: clipped robust z-score (peak curvature vs. MAD-based
+  noise of the curvature series) divided by 8. Simple, scale-free, and 1.0
+  for clean synthetic breaks.
+- **`hillshade-bounds` endpoint added** beyond the spec so the frontend can
+  get overlay corners without parsing response headers (the `X-Bounds` header
+  is also set on the PNG response).
+- **Move endpoint semantics**: the moved keypoint keeps its confidence, gains
+  `moved: true`, and its elevation is re-read from the fused DEM under the
+  new position; only its keyline is recomputed (contour snap within 500 m).
+- **Grid cap**: 25 M cells when fusing at drone resolution (memory guard);
+  AOIs over 100 km² are rejected with a clear message, as specced.
+- **Ocean detection**: missing GLO-30 tiles *or* an all-zero window (GLO-30
+  encodes sea as 0) raise a clear "open ocean" error.
+- **Tests force pysheds** so `pytest` passes with no network. The runtime
+  default remains Whitebox-first with automatic fallback.
+- **OSM raster tiles** are used directly from tile.openstreetmap.org with
+  attribution; for heavy public deployment you should switch to a dedicated
+  tile provider per the OSM tile usage policy.
+
+## Known limitations
+
+- **GLO-30 is a DSM**, not a DTM: elevations include vegetation and buildings.
+  In forested or built terrain, valleys/keypoints reflect the canopy surface.
+- **~4 m vertical RMSE** on GLO-30 means satellite-derived keypoints are
+  reconnaissance-grade only. Upload drone data for design-grade output.
+- Vertical co-registration of drone data is a constant offset, not a datum
+  transformation.
+- D8 flow routing on 30 m data produces generalized stream networks; small
+  swales are invisible at that resolution.
+- Heights are referenced to the EGM2008 geoid; contours are internally
+  consistent, which is what keyline layout needs.
