@@ -196,26 +196,36 @@ def find_keypoint(
 
 def contour_at(dem: np.ndarray, transform: Affine, elevation: float,
                near: Point, max_snap_m: float = 200.0) -> LineString | None:
-    """Contour segment at `elevation` passing nearest to `near`.
+    """Full connected contour component at `elevation` through/near `near`.
 
-    Uses skimage.find_contours (array index space), converts to map coords,
-    and returns the contour polyline whose distance to `near` is smallest
-    (and within max_snap_m), or None.
+    Uses skimage.find_contours (array index space) and keeps whole contour
+    components — never truncated pieces. At a keypoint's elevation several
+    components can pass close by (e.g. a tiny closed loop around a bump right
+    at the keypoint, plus the long landform-following contour a few meters
+    away); among components passing within one pixel of the closest, the
+    longest is chosen so the keyline traverses the surface instead of
+    circling a noise bump. The result is lightly simplified to suppress
+    pixel-staircase zigzag.
     """
+    cell = abs(transform.a)
     filled = np.where(np.isnan(dem), np.nanmin(dem) - 1000.0, dem)
     contours = measure.find_contours(filled, level=elevation)
-    best, best_d = None, np.inf
+    candidates: list[tuple[float, LineString]] = []
     for cont in contours:
         if len(cont) < 2:
             continue
         coords = [transform * (c + 0.5, r + 0.5) for r, c in cont]
         line = LineString(coords)
         d = line.distance(near)
-        if d < best_d:
-            best, best_d = line, d
-    if best is None or best_d > max_snap_m:
+        if d <= max_snap_m:
+            candidates.append((d, line))
+    if not candidates:
         return None
-    return best
+    best_d = min(d for d, _ in candidates)
+    best = max((line for d, line in candidates if d <= best_d + cell),
+               key=lambda line: line.length)
+    smoothed = best.simplify(cell * 0.5, preserve_topology=False)
+    return smoothed if isinstance(smoothed, LineString) else best
 
 
 def hillshade(dem: np.ndarray, cell_size: float, azimuth: float = 315.0,

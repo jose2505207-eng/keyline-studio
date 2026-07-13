@@ -80,6 +80,20 @@ def test_synthetic_valley_keypoint_keyline():
     assert line.distance(kp["point"]) <= 2 * CELL
 
 
+def test_keyline_spans_surface():
+    """Regression: the keyline must be the full contour component traversing
+    the terrain, not a short fragment. On the tilted V-valley the contour at
+    the keypoint elevation is a chevron running from the west edge to the
+    slope break and back — well over 60% of the grid width in total length."""
+    dem = synthetic_dem()
+    result = run_terrain_analysis(dem, TRANSFORM, Params())
+    assert len(result.keylines) == 1
+    line = result.keylines[0]["line"]
+    assert line.length >= 0.6 * NX * CELL, (
+        f"keyline is a fragment: {line.length:.0f} m < "
+        f"{0.6 * NX * CELL:.0f} m (60% of grid width)")
+
+
 def test_ridges_found_on_flanks():
     dem = synthetic_dem()
     result = run_terrain_analysis(dem, TRANSFORM, Params())

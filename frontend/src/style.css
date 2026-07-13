@@ -59,6 +59,76 @@ body,
   cursor: not-allowed;
 }
 
+.search {
+  position: relative;
+  display: flex;
+  gap: 4px;
+}
+
+.search input {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid #bbb;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.search button {
+  flex: 0 0 auto;
+  padding: 6px 8px;
+}
+
+.search-results {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+  background: #fff;
+  border: 1px solid #bbb;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  max-height: 190px;
+  overflow-y: auto;
+}
+
+.search-results li {
+  padding: 6px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  border-bottom: 1px solid #eee;
+}
+
+.search-results li:hover {
+  background: #f0f4ff;
+}
+
+.basemaps {
+  display: flex;
+  gap: 14px;
+  font-size: 13px;
+}
+
+.basemaps label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.area {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 2px 2px;
+}
+
+.area.too-big {
+  color: #c1121f;
+}
+
 .toolbar button.active {
   background: #2b6bd6;
   color: #fff;

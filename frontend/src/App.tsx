@@ -5,15 +5,39 @@ import { TerraDrawMapLibreGLAdapter } from "terra-draw-maplibre-gl-adapter";
 import * as api from "./api";
 
 const COLORS = {
-  valley: "#2b6bd6",
-  ridge: "#9c6b3c",
-  keyline: "#12841f",
-  keypoint: "#12841f",
+  valley: "#3b82f6",
+  ridge: "#b4713d",
+  keyline: "#22e04a",
+  keypoint: "#22e04a",
+  aoi: "#ffd000",
 };
+
+const MAX_AOI_KM2 = 100;
 
 const RESULT_LAYER_IDS = ["hillshade", "valleys", "ridges", "keylines", "keypoints"];
 
 type LayerKey = (typeof RESULT_LAYER_IDS)[number];
+type Basemap = "satellite" | "streets";
+
+interface SearchResult {
+  display_name: string;
+  lat: string;
+  lon: string;
+}
+
+/** Spherical polygon area (same approach as turf.area), in km². */
+function ringAreaKm2(ring: [number, number][]): number {
+  if (ring.length < 3) return 0;
+  const R = 6371008.8;
+  const rad = Math.PI / 180;
+  let total = 0;
+  for (let i = 0; i < ring.length; i++) {
+    const [l1, p1] = ring[i];
+    const [l2, p2] = ring[(i + 1) % ring.length];
+    total += (l2 - l1) * rad * (2 + Math.sin(p1 * rad) + Math.sin(p2 * rad));
+  }
+  return Math.abs((total * R * R) / 2) / 1e6;
+}
 
 export default function App() {
   const mapContainer = useRef<HTMLDivElement>(null);
@@ -23,6 +47,7 @@ export default function App() {
   const pollRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const projectIdRef = useRef<string | null>(null);
+  const lastGeocodeRef = useRef(0);
 
   const [projectId, setProjectId] = useState<string | null>(null);
   const [drawing, setDrawing] = useState(false);
@@ -31,6 +56,10 @@ export default function App() {
   const [jobLog, setJobLog] = useState<string[]>([]);
   const [hasResults, setHasResults] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [basemap, setBasemap] = useState<Basemap>("satellite");
+  const [areaKm2, setAreaKm2] = useState<number | null>(null);
+  const [searchQ, setSearchQ] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [visible, setVisible] = useState<Record<LayerKey, boolean>>({
     hillshade: true,
     valleys: true,
@@ -49,6 +78,16 @@ export default function App() {
       style: {
         version: 8,
         sources: {
+          esri: {
+            type: "raster",
+            tiles: [
+              "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            ],
+            tileSize: 256,
+            maxzoom: 19,
+            attribution:
+              "Imagery © Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+          },
           osm: {
             type: "raster",
             tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
@@ -57,7 +96,15 @@ export default function App() {
             attribution: "&copy; OpenStreetMap contributors",
           },
         },
-        layers: [{ id: "osm", type: "raster", source: "osm" }],
+        layers: [
+          { id: "basemap-esri", type: "raster", source: "esri" },
+          {
+            id: "basemap-osm",
+            type: "raster",
+            source: "osm",
+            layout: { visibility: "none" },
+          },
+        ],
       },
       center: [6.35, 44.45], // southern French Alps — plenty of relief to try
       zoom: 11,
@@ -71,6 +118,30 @@ export default function App() {
     // style has finished loading (in production builds the style is still
     // loading when this effect runs; starting early throws and blanks the app).
     map.once("load", () => {
+      // The drawn AOI is rendered by our own layers, not terra-draw: on
+      // finish we copy the polygon here and wipe the terra-draw store, so no
+      // ghost vertex/cursor elements from the draw mode can linger.
+      map.addSource("aoi", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: "aoi-fill",
+        type: "fill",
+        source: "aoi",
+        paint: { "fill-color": COLORS.aoi, "fill-opacity": 0.07 },
+      });
+      map.addLayer({
+        id: "aoi-line",
+        type: "line",
+        source: "aoi",
+        paint: {
+          "line-color": COLORS.aoi,
+          "line-width": 2,
+          "line-dasharray": [2, 1.5],
+        },
+      });
+
       const draw = new TerraDraw({
         adapter: new TerraDrawMapLibreGLAdapter({ map }),
         modes: [new TerraDrawPolygonMode()],
@@ -79,13 +150,31 @@ export default function App() {
       draw.setMode("static");
       drawRef.current = draw;
 
+      // Live area readout while the polygon is being drawn.
+      draw.on("change", () => {
+        const feat = draw
+          .getSnapshot()
+          .find((f) => f.geometry.type === "Polygon");
+        if (feat) {
+          const ring = (feat.geometry as GeoJSON.Polygon)
+            .coordinates[0] as [number, number][];
+          setAreaKm2(ringAreaKm2(ring));
+        }
+      });
+
       draw.on("finish", (id) => {
         const feat = draw.getSnapshot().find((f) => f.id === id);
         draw.setMode("static");
         setDrawing(false);
+        map.getCanvas().style.cursor = ""; // draw modes set crosshair et al.
         if (feat && feat.geometry.type === "Polygon") {
-          void handleAoiDrawn(feat.geometry as GeoJSON.Polygon);
+          const poly = feat.geometry as GeoJSON.Polygon;
+          setAoiOnMap(poly);
+          setAreaKm2(ringAreaKm2(poly.coordinates[0] as [number, number][]));
+          void handleAoiDrawn(poly);
         }
+        // Defer: clearing the store inside its own event handler is unsafe.
+        setTimeout(() => draw.clear(), 0);
       });
     });
 
@@ -97,6 +186,66 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const setAoiOnMap = (poly: GeoJSON.Polygon | null) => {
+    const src = mapRef.current?.getSource("aoi") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    src?.setData({
+      type: "FeatureCollection",
+      features: poly
+        ? [{ type: "Feature", geometry: poly, properties: {} }]
+        : [],
+    });
+  };
+
+  // -------------------------------------------------------------- basemap
+  const switchBasemap = (next: Basemap) => {
+    setBasemap(next);
+    const map = mapRef.current;
+    if (!map) return;
+    map.setLayoutProperty(
+      "basemap-esri",
+      "visibility",
+      next === "satellite" ? "visible" : "none"
+    );
+    map.setLayoutProperty(
+      "basemap-osm",
+      "visibility",
+      next === "streets" ? "visible" : "none"
+    );
+  };
+
+  // ------------------------------------------------------------- geocoding
+  // Nominatim usage policy: explicit submit only (no per-keystroke
+  // autocomplete), at most one request per second; the browser supplies the
+  // Referer header identifying this app.
+  const doSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const q = searchQ.trim();
+    if (!q) return;
+    const now = Date.now();
+    if (now - lastGeocodeRef.current < 1000) return; // debounce 1 s
+    lastGeocodeRef.current = now;
+    try {
+      const res = await fetch(
+        `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=5`,
+        { headers: { Accept: "application/json" } }
+      );
+      setSearchResults(res.ok ? await res.json() : []);
+    } catch {
+      setSearchResults([]);
+    }
+  };
+
+  const goToResult = (r: SearchResult) => {
+    setSearchResults([]);
+    setSearchQ(r.display_name.split(",")[0]);
+    mapRef.current?.flyTo({
+      center: [parseFloat(r.lon), parseFloat(r.lat)],
+      zoom: 13,
+    });
+  };
 
   // ----------------------------------------------------------- AOI / project
   const handleAoiDrawn = useCallback(async (aoi: GeoJSON.Polygon) => {
@@ -119,6 +268,8 @@ export default function App() {
     const draw = drawRef.current;
     if (!draw) return;
     draw.clear(); // one AOI at a time
+    setAoiOnMap(null);
+    setAreaKm2(null);
     setProjectId(null);
     clearResults();
     draw.setMode("polygon");
@@ -196,11 +347,14 @@ export default function App() {
         [number, number]
       ],
     });
+    // Semi-transparent so the satellite imagery reads through; every vector
+    // layer below is added after it, so valleys/keylines/keypoints render on
+    // top of the hillshade.
     map.addLayer({
       id: "hillshade",
       type: "raster",
       source: "hillshade",
-      paint: { "raster-opacity": 0.55 },
+      paint: { "raster-opacity": 0.6 },
     });
 
     map.addSource("results", { type: "geojson", data: fc });
@@ -225,12 +379,12 @@ export default function App() {
       filter: ["==", ["get", "kind"], "keyline"],
       paint: {
         "line-color": COLORS.keyline,
-        "line-width": 4,
-        "line-opacity": 0.9,
+        "line-width": 3.5,
+        "line-opacity": 0.95,
       },
     });
     // Keypoints: solid circle when drone-derived, hollow when satellite;
-    // size and opacity scale with confidence.
+    // size and opacity scale with confidence. Added last => on top.
     const conf = ["coalesce", ["get", "confidence"], 0.5] as unknown as number;
     map.addLayer({
       id: "keypoints",
@@ -383,6 +537,7 @@ export default function App() {
   const running =
     jobState === "queued" || jobState.startsWith("running") ? jobState : null;
   const error = jobState.startsWith("error:") ? jobState.slice(6) : null;
+  const areaTooBig = areaKm2 !== null && areaKm2 > MAX_AOI_KM2;
 
   return (
     <div className="app">
@@ -390,9 +545,58 @@ export default function App() {
 
       <div className="toolbar">
         <h1>Keyline Studio</h1>
+
+        <form className="search" onSubmit={doSearch}>
+          <input
+            type="text"
+            placeholder="Search a place…"
+            value={searchQ}
+            onChange={(e) => setSearchQ(e.target.value)}
+          />
+          <button type="submit" title="Search">
+            🔎
+          </button>
+          {searchResults.length > 0 && (
+            <ul className="search-results">
+              {searchResults.map((r, i) => (
+                <li key={i} onClick={() => goToResult(r)}>
+                  {r.display_name}
+                </li>
+              ))}
+            </ul>
+          )}
+        </form>
+
+        <div className="basemaps">
+          <label>
+            <input
+              type="radio"
+              name="basemap"
+              checked={basemap === "satellite"}
+              onChange={() => switchBasemap("satellite")}
+            />
+            Satellite
+          </label>
+          <label>
+            <input
+              type="radio"
+              name="basemap"
+              checked={basemap === "streets"}
+              onChange={() => switchBasemap("streets")}
+            />
+            Streets
+          </label>
+        </div>
+
         <button className={drawing ? "active" : ""} onClick={startDrawing}>
           ▰ Draw AOI {drawing ? "(click map, click first point to finish)" : ""}
         </button>
+        {areaKm2 !== null && (
+          <div className={`area ${areaTooBig ? "too-big" : ""}`}>
+            Area: {areaKm2 < 10 ? areaKm2.toFixed(2) : areaKm2.toFixed(1)} km²
+            {areaTooBig ? ` — exceeds the ${MAX_AOI_KM2} km² limit` : ""}
+          </div>
+        )}
         <button
           disabled={!projectId || busy}
           onClick={() => fileInputRef.current?.click()}
@@ -406,7 +610,7 @@ export default function App() {
           style={{ display: "none" }}
           onChange={onDroneFile}
         />
-        <button disabled={!projectId || busy} onClick={analyze}>
+        <button disabled={!projectId || busy || areaTooBig} onClick={analyze}>
           ▶ Analyze
         </button>
         <button disabled={!hasResults} onClick={exportGeoJSON}>
