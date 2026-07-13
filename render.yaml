@@ -1,0 +1,12 @@
+# Render Blueprint — deploys the backend as a Docker web service.
+# Import at https://dashboard.render.com/blueprints (connect the GitHub repo).
+services:
+  - type: web
+    name: keyline-backend
+    runtime: docker
+    rootDir: backend
+    plan: free # free tier spins down when idle; first request after idle is slow
+    healthCheckPath: /docs
+    envVars:
+      - key: AWS_NO_SIGN_REQUEST
+        value: "YES"

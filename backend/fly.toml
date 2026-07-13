@@ -1,0 +1,22 @@
+# Fly.io config — from backend/: `fly launch --copy-config --yes` then `fly deploy`.
+app = "keyline-backend"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  AWS_NO_SIGN_REQUEST = "YES"
+  PORT = "8000"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
