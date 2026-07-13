@@ -49,12 +49,96 @@ export async function createProject(name: string, aoi: GeoJSON.Polygon): Promise
   return body.project_id;
 }
 
-export async function uploadDroneDem(projectId: string, file: File): Promise<void> {
+export interface DroneInfo {
+  crs: string;
+  resolution_m: [number, number];
+  size_px: [number, number];
+  elevation_range_m: [number, number];
+  footprint: GeoJSON.Polygon;
+}
+
+export async function uploadDroneDem(projectId: string, file: File): Promise<DroneInfo> {
   const form = new FormData();
   form.append("file", file);
   const res = await fetch(url(`/api/projects/${projectId}/drone-dem`), {
     method: "POST",
     body: form,
+  });
+  return jsonOrThrow(res);
+}
+
+export async function importBoundary(file: File): Promise<GeoJSON.Polygon> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(url("/api/import-boundary"), { method: "POST", body: form });
+  const body = await jsonOrThrow(res);
+  return body.aoi;
+}
+
+export function exportKmlUrl(projectId: string): string {
+  return url(`/api/projects/${projectId}/export.kml`);
+}
+
+// ---- georeferenced map scans ------------------------------------------------
+
+export interface MapMeta {
+  map_id: string;
+  width: number;
+  height: number;
+  page_count: number;
+  page: number;
+}
+
+export interface GeorefResult {
+  corners: [number, number][]; // UL, UR, LR, LL lng/lat
+  rms_m: number;
+}
+
+export async function uploadMapScan(file: File): Promise<MapMeta> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(url("/api/maps"), { method: "POST", body: form });
+  return jsonOrThrow(res);
+}
+
+export async function selectMapPage(mapId: string, page: number): Promise<MapMeta> {
+  const res = await fetch(url(`/api/maps/${mapId}/page`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ page }),
+  });
+  return jsonOrThrow(res);
+}
+
+export function mapImageUrl(mapId: string, cacheKey?: number | string): string {
+  return url(`/api/maps/${mapId}/image${cacheKey !== undefined ? `?v=${cacheKey}` : ""}`);
+}
+
+export interface ControlPoint {
+  px: number;
+  py: number;
+  e: number;
+  n: number;
+}
+
+export async function georefMap(
+  mapId: string,
+  epsg: number,
+  points: ControlPoint[]
+): Promise<GeorefResult> {
+  const res = await fetch(url(`/api/maps/${mapId}/georef`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ epsg, points }),
+  });
+  return jsonOrThrow(res);
+}
+
+export async function attachMap(projectId: string, mapId: string): Promise<void> {
+  const res = await fetch(url(`/api/projects/${projectId}/attach-map`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ map_id: mapId }),
   });
   await jsonOrThrow(res);
 }

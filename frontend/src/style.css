@@ -129,6 +129,282 @@ body,
   color: #c1121f;
 }
 
+.warning-banner {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  max-width: min(760px, calc(100vw - 320px));
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: #b3261e;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.45;
+  padding: 12px 14px;
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.warning-banner button {
+  background: transparent;
+  border: none;
+  color: #fff;
+  font-size: 15px;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.drone-info {
+  font-size: 12px;
+  line-height: 1.5;
+  background: #fff7e8;
+  border: 1px solid #e8c98a;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.drone-info label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  cursor: pointer;
+}
+
+.dsm-note {
+  color: #8a5a00;
+  margin-top: 4px;
+}
+
+.scan-controls {
+  font-size: 12px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.scan-controls input[type="range"] {
+  width: 100%;
+}
+
+.scan-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.scan-buttons button {
+  flex: 1;
+  font-size: 12px;
+  padding: 5px 6px;
+}
+
+.export-wrap {
+  position: relative;
+}
+
+.export-wrap > button {
+  width: 100%;
+}
+
+.export-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  background: #fff;
+  border: 1px solid #bbb;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  display: flex;
+  flex-direction: column;
+}
+
+.export-menu button {
+  border: none;
+  border-bottom: 1px solid #eee;
+  border-radius: 0;
+}
+
+/* ---- georeferencing modal ---- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal.georef {
+  background: #fff;
+  border-radius: 10px;
+  width: min(1200px, 94vw);
+  height: min(760px, 92vh);
+  display: flex;
+  overflow: hidden;
+}
+
+.georef-image {
+  flex: 1.6;
+  overflow: auto;
+  background: #444;
+  padding: 10px;
+}
+
+.georef-image-inner {
+  position: relative;
+  display: inline-block;
+}
+
+.georef-image img {
+  display: block;
+  max-width: none;
+  width: 100%;
+  cursor: crosshair;
+}
+
+.cp-marker {
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  margin: -10px 0 0 -10px;
+  border-radius: 50%;
+  background: #e11;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+
+.cp-marker.pending {
+  background: #06c;
+}
+
+.georef-side {
+  flex: 1;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 13px;
+  overflow-y: auto;
+}
+
+.georef-side h2 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.georef-side p {
+  margin: 0;
+  color: #444;
+  line-height: 1.5;
+}
+
+.georef-side select,
+.georef-side input[type="text"] {
+  padding: 5px 7px;
+  border: 1px solid #bbb;
+  border-radius: 5px;
+  font-size: 13px;
+}
+
+.georef-side button {
+  padding: 7px 10px;
+  border: 1px solid #bbb;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.georef-side button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.georef-side button.primary {
+  background: #2b6bd6;
+  color: #fff;
+  border-color: #2b6bd6;
+}
+
+.custom-epsg {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pending-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: #eef4ff;
+  border: 1px solid #bcd;
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.cp-list {
+  margin: 0;
+  padding-left: 4px;
+  list-style: none;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.cp-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+}
+
+.cp-list button {
+  padding: 0 6px;
+  font-size: 11px;
+}
+
+.rms {
+  font-weight: 700;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+
+.rms.good {
+  background: #e6f6e6;
+  color: #14691b;
+}
+
+.rms.bad {
+  background: #fbe9e7;
+  color: #b3261e;
+}
+
+.georef-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: auto;
+}
+
+.georef-actions button {
+  flex: 1;
+}
+
 .toolbar button.active {
   background: #2b6bd6;
   color: #fff;

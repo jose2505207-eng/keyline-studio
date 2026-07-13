@@ -30,10 +30,51 @@ BBOX_PAD_FRAC = 0.10  # pad fetch bbox ~10% to avoid edge artifacts in routing
 
 @dataclass
 class Params:
-    stream_threshold_frac: float = 0.01
-    min_valley_length_m: float = 150.0
-    min_keypoint_confidence: float = 0.3
+    min_drainage_area_m2: float = 5000.0   # min contributing area for a stream cell
+    min_line_length_m: float = 100.0       # valley/ridge polylines shorter than this are noise
+    min_valley_length_m: float = 150.0     # minimum valley length to search for a keypoint
+    min_keypoint_confidence: float = 0.5   # weak slope breaks are dropped
+    min_valley_relief_m: float = 2.0       # satellite keypoints need >= this profile relief
     profile_spacing_px: float = 1.0
+    smooth_sigma_px: float = 1.5           # satellite DEM pre-smooth; 0 disables (advanced)
+    relief_warn_m: float = 15.0            # satellite relief below this -> reliability warning
+    relief_reject_m: float = 6.0           # satellite relief below this -> no keypoints/keylines
+    min_aoi_px: int = 40                   # AOIs under ~40x40 satellite pixels -> warning
+
+
+def assess_terrain_quality(dem_values: np.ndarray, has_drone: bool,
+                           params: Params = Params()) -> dict:
+    """Honest data-quality check before analysis.
+
+    GLO-30 has ~2-4 m vertical RMSE; when an AOI's total relief (p98 - p2)
+    approaches that error, flow routing mostly routes noise. Returns the
+    relief, a user-facing warning when results will be unreliable, and
+    whether keypoints/keylines must be suppressed entirely (relief below
+    ``relief_reject_m``). Drone-sourced grids are trusted as-is.
+    """
+    v = dem_values[np.isfinite(dem_values)]
+    relief = float(np.percentile(v, 98) - np.percentile(v, 2)) if v.size else 0.0
+    n_px = int(v.size)
+    warning = None
+    suppress = False
+    if not has_drone:
+        too_small = n_px < params.min_aoi_px ** 2
+        if relief < params.relief_reject_m:
+            suppress = True
+        if relief < params.relief_warn_m or too_small:
+            extra = (" The AOI also spans very few satellite pixels"
+                     f" ({n_px}, ~{params.min_aoi_px}x{params.min_aoi_px} needed)."
+                     if too_small else "")
+            warning = (
+                f"Terrain relief at this site ({relief:.1f} m) is close to the "
+                "satellite DEM's vertical error (~4 m). Results are unreliable — "
+                "upload a drone DTM for this parcel." + extra
+            )
+            if suppress:
+                warning += (" Relief is below the 6 m minimum, so keypoints and "
+                            "keylines were not generated (hillshade only).")
+    return {"relief_m": round(relief, 1), "n_px": n_px, "warning": warning,
+            "suppress": suppress}
 
 
 @dataclass
@@ -50,11 +91,14 @@ def run_terrain_analysis(
     transform: Affine,
     params: Params = Params(),
     progress: Callable[[str], None] = lambda s: None,
+    drone_weight: np.ndarray | None = None,
 ) -> TerrainResult:
     """Spec steps 4-9: conditioning -> flow -> valleys/ridges -> keypoints -> keylines."""
     engine = get_engine()
     cell = abs(transform.a)
     res = TerrainResult()
+    # Physically meaningful stream threshold: contributing area in m² -> cells.
+    threshold_cells = max(params.min_drainage_area_m2 / (cell * cell), 2.0)
 
     progress(f"hydrological conditioning + flow routing ({engine.name})")
     conditioned, facc = engine.flow_accumulation(dem, transform)
@@ -63,8 +107,8 @@ def run_terrain_analysis(
     progress("extracting valleys")
     res.valleys = terrain.extract_stream_lines(
         facc, conditioned, transform,
-        threshold_frac=params.stream_threshold_frac,
-        min_length_m=cell * 2,
+        threshold_cells=threshold_cells,
+        min_length_m=params.min_line_length_m,
     )
 
     progress("extracting ridges")
@@ -73,9 +117,17 @@ def run_terrain_analysis(
     )
     res.ridges = terrain.extract_stream_lines(
         facc_inv, conditioned, transform,
-        threshold_frac=params.stream_threshold_frac,
-        min_length_m=cell * 2,
+        threshold_cells=threshold_cells,
+        min_length_m=params.min_line_length_m,
     )
+
+    def _drone_backed(pt) -> bool:
+        if drone_weight is None:
+            return False
+        col, row = ~transform * (pt.x, pt.y)
+        r, c = int(row), int(col)
+        return (0 <= r < drone_weight.shape[0] and 0 <= c < drone_weight.shape[1]
+                and drone_weight[r, c] > 0.5)
 
     progress("detecting keypoints")
     for vi, valley in enumerate(res.valleys):
@@ -90,6 +142,11 @@ def run_terrain_analysis(
         if hit is None:
             continue
         idx, conf = hit
+        relief = float(np.max(elevs) - np.min(elevs))
+        # On satellite data, a valley whose whole profile spans less than the
+        # DEM's vertical noise cannot support a credible slope break.
+        if relief < params.min_valley_relief_m and not _drone_backed(pts[idx]):
+            continue
         res.keypoints.append({
             "point": pts[idx],
             "elevation": float(elevs[idx]),
@@ -120,7 +177,8 @@ def _utm_grid_for_aoi(aoi_wgs84) -> tuple[str, object]:
 
 
 def _write_outputs(project_dir: str, dem_da: xr.DataArray, result: TerrainResult,
-                   aoi_utm, utm_crs: str, drone_weight: np.ndarray | None):
+                   aoi_utm, utm_crs: str, drone_weight: np.ndarray | None,
+                   extra_properties: dict | None = None):
     """Clip vectors to AOI, reproject to WGS84, write GeoJSON + hillshade."""
     from PIL import Image
 
@@ -182,6 +240,9 @@ def _write_outputs(project_dir: str, dem_da: xr.DataArray, result: TerrainResult
                                             "id": f"l{kl['keypoint_idx']}"}})
 
     fc = {"type": "FeatureCollection", "features": features}
+    if extra_properties:
+        # Foreign member (RFC 7946 §6.1) carrying data-quality info for the UI.
+        fc["properties"] = extra_properties
     with open(os.path.join(project_dir, "results.geojson"), "w") as f:
         json.dump(fc, f)
 
@@ -230,6 +291,23 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
     sat_utm = sat.rio.reproject(utm_crs, resampling=Resampling.bilinear)
     sat_utm = sat_utm.where(np.abs(sat_utm) < 1e10)
 
+    # --- honest data-quality guard, on the raw (unsmoothed) satellite DEM
+    progress("checking terrain relief vs satellite vertical error")
+    try:
+        aoi_clip = sat_utm.rio.clip([aoi_utm.__geo_interface__], all_touched=True)
+        clip_values = aoi_clip.values
+    except Exception:  # degenerate AOIs — fall back to the padded grid
+        clip_values = sat_utm.values
+    quality = assess_terrain_quality(np.asarray(clip_values, dtype="float32"),
+                                     has_drone=bool(drone_path), params=params)
+
+    # --- satellite pre-smooth at native resolution (never the drone raster)
+    if params.smooth_sigma_px > 0:
+        progress("smoothing satellite DEM (noise suppression)")
+        sat_utm = sat_utm.copy(
+            data=terrain.presmooth_dem(
+                sat_utm.values.astype("float32"), params.smooth_sigma_px))
+
     drone_weight = None
     dem_da = sat_utm
     if drone_path:
@@ -260,8 +338,14 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
         raise ValueError("The AOI contains no elevation data.")
     dem_da = dem_da.copy(data=dem)
 
-    # --- terrain analysis (steps 4-9)
-    result = run_terrain_analysis(dem, dem_da.rio.transform(), params, progress)
+    # --- terrain analysis (steps 4-9); suppressed entirely when the terrain
+    # signal is below the satellite noise floor (hillshade still produced)
+    if quality["suppress"]:
+        progress("relief below reliability floor — skipping vector analysis")
+        result = TerrainResult()
+    else:
+        result = run_terrain_analysis(dem, dem_da.rio.transform(), params,
+                                      progress, drone_weight=drone_weight)
 
     # --- persist DEM for keypoint-move recomputation, then outputs
     progress("writing outputs")
@@ -273,7 +357,13 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
     with open(os.path.join(project_dir, "meta.json"), "w") as f:
         json.dump({"utm_crs": utm_crs}, f)
 
-    return _write_outputs(project_dir, dem_da, result, aoi_utm, utm_crs, drone_weight)
+    fc = _write_outputs(project_dir, dem_da, result, aoi_utm, utm_crs, drone_weight,
+                        extra_properties={
+                            "warning": quality["warning"],
+                            "relief_m": quality["relief_m"],
+                            "keylines_suppressed": quality["suppress"],
+                        })
+    return fc
 
 
 def recompute_keyline(project_dir: str, aoi_geojson: dict, kid: str,

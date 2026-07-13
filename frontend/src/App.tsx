@@ -3,6 +3,7 @@ import maplibregl from "maplibre-gl";
 import { TerraDraw, TerraDrawPolygonMode } from "terra-draw";
 import { TerraDrawMapLibreGLAdapter } from "terra-draw-maplibre-gl-adapter";
 import * as api from "./api";
+import GeorefModal from "./GeorefModal";
 
 const COLORS = {
   valley: "#3b82f6",
@@ -60,6 +61,19 @@ export default function App() {
   const [areaKm2, setAreaKm2] = useState<number | null>(null);
   const [searchQ, setSearchQ] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [warning, setWarning] = useState<string | null>(null);
+  const [droneInfo, setDroneInfo] = useState<api.DroneInfo | null>(null);
+  const [isDsm, setIsDsm] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [mapMeta, setMapMeta] = useState<api.MapMeta | null>(null);
+  const [scanOverlay, setScanOverlay] = useState<{
+    mapId: string;
+    corners: [number, number][];
+    rms: number;
+  } | null>(null);
+  const [scanOpacity, setScanOpacity] = useState(0.7);
+  const importInputRef = useRef<HTMLInputElement>(null);
+  const scanInputRef = useRef<HTMLInputElement>(null);
   const [visible, setVisible] = useState<Record<LayerKey, boolean>>({
     hillshade: true,
     valleys: true,
@@ -141,6 +155,16 @@ export default function App() {
           "line-dasharray": [2, 1.5],
         },
       });
+      map.addSource("drone-fp", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: "drone-fp",
+        type: "line",
+        source: "drone-fp",
+        paint: { "line-color": "#ff7b00", "line-width": 2.5 },
+      });
 
       const draw = new TerraDraw({
         adapter: new TerraDrawMapLibreGLAdapter({ map }),
@@ -199,6 +223,138 @@ export default function App() {
     });
   };
 
+  const setDroneFootprint = (poly: GeoJSON.Polygon | null) => {
+    const src = mapRef.current?.getSource("drone-fp") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    src?.setData({
+      type: "FeatureCollection",
+      features: poly ? [{ type: "Feature", geometry: poly, properties: {} }] : [],
+    });
+  };
+
+  const flyToPolygon = (poly: GeoJSON.Polygon) => {
+    const ring = poly.coordinates[0];
+    const lons = ring.map((c) => c[0]);
+    const lats = ring.map((c) => c[1]);
+    mapRef.current?.fitBounds(
+      [
+        [Math.min(...lons), Math.min(...lats)],
+        [Math.max(...lons), Math.max(...lats)],
+      ],
+      { padding: 80, duration: 1200 }
+    );
+  };
+
+  /** Shared AOI intake for imported boundaries and map-extent AOIs. */
+  const adoptAoi = async (poly: GeoJSON.Polygon, mapId?: string) => {
+    drawRef.current?.clear();
+    setAoiOnMap(poly);
+    setAreaKm2(ringAreaKm2(poly.coordinates[0] as [number, number][]));
+    flyToPolygon(poly);
+    await handleAoiDrawn(poly);
+    if (mapId) {
+      // link the georeferenced scan to the new project (restores overlay later)
+      try {
+        const pid = projectIdRef.current;
+        if (pid) await api.attachMap(pid, mapId);
+      } catch {
+        /* non-fatal */
+      }
+    }
+  };
+
+  const onImportBoundary = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setBusy(true);
+    try {
+      const poly = await api.importBoundary(file);
+      await adoptAoi(poly);
+      setJobState("");
+    } catch (err) {
+      setJobState(`error:${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // ------------------------------------------------------- map scan overlay
+  const onScanFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setBusy(true);
+    try {
+      const meta = await api.uploadMapScan(file);
+      setMapMeta(meta); // opens the georeferencing modal
+    } catch (err) {
+      setJobState(`error:${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const applyScanOverlay = (georef: api.GeorefResult, meta: api.MapMeta) => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (map.getLayer("scan")) map.removeLayer("scan");
+    if (map.getSource("scan")) map.removeSource("scan");
+    map.addSource("scan", {
+      type: "image",
+      url: api.mapImageUrl(meta.map_id, meta.page),
+      coordinates: georef.corners as [
+        [number, number],
+        [number, number],
+        [number, number],
+        [number, number]
+      ],
+    });
+    // beneath the AOI outline (and any result layers added later go on top)
+    map.addLayer(
+      {
+        id: "scan",
+        type: "raster",
+        source: "scan",
+        paint: { "raster-opacity": scanOpacity },
+      },
+      map.getLayer("aoi-fill") ? "aoi-fill" : undefined
+    );
+    setScanOverlay({ mapId: meta.map_id, corners: georef.corners, rms: georef.rms_m });
+    setMapMeta(null);
+    const lons = georef.corners.map((c) => c[0]);
+    const lats = georef.corners.map((c) => c[1]);
+    map.fitBounds(
+      [
+        [Math.min(...lons), Math.min(...lats)],
+        [Math.max(...lons), Math.max(...lats)],
+      ],
+      { padding: 60, duration: 1200 }
+    );
+  };
+
+  const setOverlayOpacity = (v: number) => {
+    setScanOpacity(v);
+    const map = mapRef.current;
+    if (map?.getLayer("scan")) map.setPaintProperty("scan", "raster-opacity", v);
+  };
+
+  const removeScanOverlay = () => {
+    const map = mapRef.current;
+    if (map?.getLayer("scan")) map.removeLayer("scan");
+    if (map?.getSource("scan")) map.removeSource("scan");
+    setScanOverlay(null);
+  };
+
+  const useScanExtentAsAoi = async () => {
+    if (!scanOverlay) return;
+    const ring = [...scanOverlay.corners, scanOverlay.corners[0]].map(
+      (c) => [c[0], c[1]] as [number, number]
+    );
+    await adoptAoi({ type: "Polygon", coordinates: [ring] }, scanOverlay.mapId);
+  };
+
   // -------------------------------------------------------------- basemap
   const switchBasemap = (next: Basemap) => {
     setBasemap(next);
@@ -251,6 +407,9 @@ export default function App() {
   const handleAoiDrawn = useCallback(async (aoi: GeoJSON.Polygon) => {
     clearResults();
     setDroneName(null);
+    setDroneInfo(null);
+    setDroneFootprint(null);
+    setIsDsm(false);
     setJobState("");
     setJobLog([]);
     try {
@@ -283,8 +442,10 @@ export default function App() {
     if (!file || !projectId) return;
     setBusy(true);
     try {
-      await api.uploadDroneDem(projectId, file);
+      const info = await api.uploadDroneDem(projectId, file);
       setDroneName(file.name);
+      setDroneInfo(info);
+      setDroneFootprint(info.footprint);
       setJobState("");
     } catch (err) {
       setJobState(`error:${(err as Error).message}`);
@@ -336,6 +497,8 @@ export default function App() {
     if (!map) return;
     const [fc, hs] = await Promise.all([api.getResults(pid), api.getHillshade(pid)]);
     resultsRef.current = fc;
+    const fcProps = (fc as { properties?: { warning?: string | null } }).properties;
+    setWarning(fcProps?.warning ?? null);
 
     map.addSource("hillshade", {
       type: "image",
@@ -417,6 +580,8 @@ export default function App() {
     const map = mapRef.current;
     resultsRef.current = null;
     setHasResults(false);
+    setWarning(null);
+    setExportOpen(false);
     if (!map) return;
     for (const id of RESULT_LAYER_IDS) {
       if (map.getLayer(id)) map.removeLayer(id);
@@ -543,6 +708,24 @@ export default function App() {
     <div className="app">
       <div ref={mapContainer} className="map" />
 
+      {warning && (
+        <div className="warning-banner">
+          <span>⚠ {warning}</span>
+          <button onClick={() => setWarning(null)} title="Dismiss">
+            ✕
+          </button>
+        </div>
+      )}
+
+      {mapMeta && (
+        <GeorefModal
+          meta={mapMeta}
+          onMeta={setMapMeta}
+          onApply={applyScanOverlay}
+          onClose={() => setMapMeta(null)}
+        />
+      )}
+
       <div className="toolbar">
         <h1>Keyline Studio</h1>
 
@@ -591,6 +774,46 @@ export default function App() {
         <button className={drawing ? "active" : ""} onClick={startDrawing}>
           ▰ Draw AOI {drawing ? "(click map, click first point to finish)" : ""}
         </button>
+        <button disabled={busy} onClick={() => importInputRef.current?.click()}>
+          ⬈ Import boundary (KML/KMZ/GeoJSON)
+        </button>
+        <input
+          ref={importInputRef}
+          type="file"
+          accept=".kml,.kmz,.geojson,.json"
+          style={{ display: "none" }}
+          onChange={onImportBoundary}
+        />
+        <button disabled={busy} onClick={() => scanInputRef.current?.click()}>
+          🗺 Locate from map scan (PNG/JPG/PDF)
+        </button>
+        <input
+          ref={scanInputRef}
+          type="file"
+          accept=".png,.jpg,.jpeg,.pdf"
+          style={{ display: "none" }}
+          onChange={onScanFile}
+        />
+        {scanOverlay && (
+          <div className="scan-controls">
+            <div>
+              Map overlay (RMS {scanOverlay.rms} m) — opacity{" "}
+              {Math.round(scanOpacity * 100)}%
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={scanOpacity}
+              onChange={(e) => setOverlayOpacity(parseFloat(e.target.value))}
+            />
+            <div className="scan-buttons">
+              <button onClick={useScanExtentAsAoi}>Use map extent as AOI</button>
+              <button onClick={removeScanOverlay}>Remove overlay</button>
+            </div>
+          </div>
+        )}
         {areaKm2 !== null && (
           <div className={`area ${areaTooBig ? "too-big" : ""}`}>
             Area: {areaKm2 < 10 ? areaKm2.toFixed(2) : areaKm2.toFixed(1)} km²
@@ -601,7 +824,8 @@ export default function App() {
           disabled={!projectId || busy}
           onClick={() => fileInputRef.current?.click()}
         >
-          ⛰ Upload drone DEM {droneName ? `✓ ${droneName}` : "(optional)"}
+          ⛰ Upload DTM (bare-earth) GeoTIFF{" "}
+          {droneName ? `✓ ${droneName}` : "(optional)"}
         </button>
         <input
           ref={fileInputRef}
@@ -610,12 +834,58 @@ export default function App() {
           style={{ display: "none" }}
           onChange={onDroneFile}
         />
+        {droneInfo && (
+          <div className="drone-info">
+            {droneInfo.crs} · {droneInfo.resolution_m[0]} m/px ·{" "}
+            {droneInfo.elevation_range_m[0]}–{droneInfo.elevation_range_m[1]} m —
+            footprint shown in orange; confirm it lands on your parcel.
+            <label>
+              <input
+                type="checkbox"
+                checked={isDsm}
+                onChange={(e) => setIsDsm(e.target.checked)}
+              />
+              This file is a DSM (includes vegetation)
+            </label>
+            {isDsm && (
+              <div className="dsm-note">
+                Note: vegetation and structures in a DSM will distort valleys
+                and keylines — a bare-earth DTM gives design-grade results.
+              </div>
+            )}
+          </div>
+        )}
         <button disabled={!projectId || busy || areaTooBig} onClick={analyze}>
           ▶ Analyze
         </button>
-        <button disabled={!hasResults} onClick={exportGeoJSON}>
-          ⇩ Export GeoJSON
-        </button>
+        <div className="export-wrap">
+          <button
+            disabled={!hasResults}
+            onClick={() => setExportOpen((o) => !o)}
+          >
+            ⇩ Export {exportOpen ? "▴" : "▾"}
+          </button>
+          {exportOpen && hasResults && (
+            <div className="export-menu">
+              <button
+                onClick={() => {
+                  exportGeoJSON();
+                  setExportOpen(false);
+                }}
+              >
+                GeoJSON
+              </button>
+              <button
+                onClick={() => {
+                  if (projectId) window.open(api.exportKmlUrl(projectId), "_blank");
+                  setExportOpen(false);
+                }}
+              >
+                KML (Google Earth)
+              </button>
+            </div>
+          )}
+        </div>
 
         {(running || error || jobState === "done") && (
           <div className="status">

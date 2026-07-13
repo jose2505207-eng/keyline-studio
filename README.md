@@ -214,6 +214,50 @@ SQLite (`backend/data/keyline.sqlite`). No Redis/Celery.
   attribution; for heavy public deployment you should switch to a dedicated
   tile provider per the OSM tile usage policy.
 
+## Data-quality guard (fix round 2)
+
+GLO-30's ~2-4 m vertical noise exceeds the real pixel-to-pixel signal on
+gentle terrain, so unguarded D8 routing renders noise. The pipeline now:
+
+- Gaussian-smooths the satellite DEM before conditioning (sigma 1.5 px,
+  `Params.smooth_sigma_px`) — never applied to uploaded drone DTMs;
+- thresholds streams by **contributing drainage area** (default 5,000 m²,
+  `Params.min_drainage_area_m2`) instead of a fraction of max accumulation,
+  and drops polylines under 100 m;
+- requires keypoint confidence ≥ 0.5 and ≥ 2 m of valley-profile relief on
+  satellite data;
+- computes AOI relief (p98−p2): below 15 m (or under ~40×40 satellite px) a
+  prominent unreliability warning banner is returned with the results; below
+  6 m, keypoints/keylines are suppressed entirely (hillshade still shown).
+
+## Import / export
+
+- **Import boundary**: KML, KMZ (doc.kml is extracted) or GeoJSON — parsed
+  with `fastkml`; the first polygon becomes the AOI.
+- **Export**: GeoJSON or styled KML (valleys/ridges/keypoints/keylines in
+  separate folders, keypoint confidence + source in descriptions, plus the
+  AOI boundary) — opens directly in Google Earth and re-imports cleanly.
+
+## Locate from a map scan
+
+Upload a topographic map image (PNG/JPG) or PDF (page 1 by default; selector
+for multi-page — rendered server-side with `pypdfium2`, no poppler). Pick the
+printed grid's CRS (UTM 11N–16N or any EPSG), click ≥2 recognizable points
+and type their printed easting/northing: 2 points fit a similarity transform,
+3+ a least-squares affine; the RMS error is shown (warned above 5 m). The
+scan then overlays the map (opacity slider) and "Use map extent as AOI"
+starts a normal analysis. Control points persist server-side per map and are
+linked to projects created from them.
+
+### Future: contour-to-DEM extraction (not implemented)
+
+Digitizing the scan's contour lines into a DEM would require contour tracing
+(raster vectorization of the drawn lines), elevation attribution (reading or
+asking for each contour's label), and surface interpolation between contours.
+That chain is inherently less accurate than obtaining the surveyor's original
+DTM GeoTIFF, which this tool already accepts — so it is deliberately out of
+scope. OCR of printed grid labels is likewise out of scope.
+
 ## Known limitations
 
 - **GLO-30 is a DSM**, not a DTM: elevations include vegetation and buildings.

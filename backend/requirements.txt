@@ -21,6 +21,10 @@ pillow>=10.0
 whitebox>=2.3
 pysheds>=0.4
 
+# Boundary import/export (KML/KMZ) and map-scan PDFs
+fastkml>=1.4
+pypdfium2>=5.0
+
 # Tests
 pytest>=8.0
 httpx>=0.27

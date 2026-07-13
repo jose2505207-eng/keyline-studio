@@ -66,8 +66,15 @@ def create_project(body: ProjectIn):
 
 @app.post("/api/projects/{pid}/drone-dem")
 async def upload_drone_dem(pid: str, file: UploadFile):
+    """Accept a photogrammetry DTM GeoTIFF (any projected or geographic CRS —
+    reprojection happens in the pipeline). Validates band count, CRS presence,
+    that it isn't all nodata, and that elevations are plausible; reports the
+    detected CRS/resolution/bounds and a WGS84 footprint so the user can
+    confirm it landed in the right place."""
     _require_project(pid)
+    import numpy as np
     import rasterio
+    from pyproj import Transformer
 
     dest = os.path.join(project_dir(pid), "drone_dem.tif")
     os.makedirs(project_dir(pid), exist_ok=True)
@@ -79,12 +86,38 @@ async def upload_drone_dem(pid: str, file: UploadFile):
             if src.count != 1:
                 raise ValueError(f"expected a single-band raster, got {src.count} bands")
             if src.crs is None:
-                raise ValueError("raster has no CRS")
+                raise ValueError("raster has no CRS — export it georeferenced")
+            # decimated masked read: cheap stats without loading a huge DTM
+            out_h = min(src.height, 512)
+            out_w = min(src.width, 512)
+            arr = src.read(1, out_shape=(out_h, out_w), masked=True)
+            arr = np.ma.masked_invalid(arr)
+            if arr.mask.all():
+                raise ValueError("raster contains only nodata")
+            lo, hi = float(arr.min()), float(arr.max())
+            if lo < -500.0 or hi > 9000.0:
+                raise ValueError(
+                    f"elevations {lo:.0f}..{hi:.0f} m are outside -500..9000 m — "
+                    "is this really a DTM?")
+            b = src.bounds
+            tr = Transformer.from_crs(src.crs, "EPSG:4326", always_xy=True)
+            ring = [list(tr.transform(x, y)) for x, y in
+                    [(b.left, b.top), (b.right, b.top), (b.right, b.bottom),
+                     (b.left, b.bottom), (b.left, b.top)]]
+            info = {
+                "crs": str(src.crs),
+                "resolution_m": [round(abs(src.res[0]), 3), round(abs(src.res[1]), 3)],
+                "size_px": [src.width, src.height],
+                "elevation_range_m": [round(lo, 1), round(hi, 1)],
+                "footprint": {"type": "Polygon", "coordinates": [ring]},
+            }
+    except HTTPException:
+        raise
     except Exception as exc:
         os.remove(dest)
-        raise HTTPException(422, f"Not a usable GeoTIFF DEM: {exc}")
+        raise HTTPException(422, f"Not a usable GeoTIFF DTM: {exc}")
     db.set_drone_path(pid, dest)
-    return {"ok": True}
+    return {"ok": True, **info}
 
 
 def _run_job(jid: str, pid: str):
@@ -165,3 +198,204 @@ def move_keypoint(pid: str, kid: str, body: MoveIn):
         raise HTTPException(404, f"Keypoint {kid} not found")
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(422, str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Boundary import (KML/KMZ/GeoJSON) + KML export
+
+
+@app.post("/api/import-boundary")
+async def import_boundary(file: UploadFile):
+    from .kml_io import BoundaryError, parse_boundary
+
+    data = await file.read()
+    try:
+        poly = parse_boundary(file.filename or "", data)
+    except BoundaryError as exc:
+        raise HTTPException(422, str(exc))
+    return {"aoi": poly}
+
+
+@app.get("/api/projects/{pid}/export.kml")
+def export_kml(pid: str):
+    from fastapi.responses import Response
+
+    from .kml_io import results_to_kml
+
+    proj = _require_project(pid)
+    path = os.path.join(project_dir(pid), "results.geojson")
+    if not os.path.exists(path):
+        raise HTTPException(404, "No results yet — run analyze first")
+    with open(path) as f:
+        fc = json.load(f)
+    kml_text = results_to_kml(fc, proj["aoi"], f"Keyline Studio — {proj['name']}")
+    return Response(
+        content=kml_text,
+        media_type="application/vnd.google-earth.kml+xml",
+        headers={"Content-Disposition": 'attachment; filename="keyline-results.kml"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Georeferenced map scans (PNG/JPG/PDF)
+
+MAPS_DIR = os.path.join(DATA_DIR, "maps")
+
+
+def _map_dir(mid: str) -> str:
+    d = os.path.join(MAPS_DIR, mid)
+    if not os.path.isdir(d):
+        raise HTTPException(404, "Map not found")
+    return d
+
+
+def _render_map_page(map_dir: str, page: int) -> dict:
+    """Render page N of the stored original to map.png (PDF via pypdfium2 at
+    ~180 DPI; images pass through)."""
+    from PIL import Image
+
+    meta_path = os.path.join(map_dir, "map.json")
+    with open(meta_path) as f:
+        meta = json.load(f)
+    original = os.path.join(map_dir, meta["original"])
+    if meta["original"].lower().endswith(".pdf"):
+        import pypdfium2 as pdfium
+
+        pdf = pdfium.PdfDocument(original)
+        if not (1 <= page <= len(pdf)):
+            raise HTTPException(422, f"Page {page} out of range (1..{len(pdf)})")
+        bitmap = pdf[page - 1].render(scale=180 / 72)
+        img = bitmap.to_pil()
+    else:
+        img = Image.open(original)
+        img.load()
+        page = 1
+    img = img.convert("RGB")
+    img.save(os.path.join(map_dir, "map.png"))
+    meta.update({"width": img.width, "height": img.height, "page": page})
+    with open(meta_path, "w") as f:
+        json.dump(meta, f)
+    return meta
+
+
+@app.post("/api/maps")
+async def upload_map(file: UploadFile):
+    import uuid
+
+    name = (file.filename or "map").lower()
+    ext = os.path.splitext(name)[1]
+    if ext not in (".png", ".jpg", ".jpeg", ".pdf"):
+        raise HTTPException(422, "Use a .png, .jpg or .pdf map file")
+    mid = uuid.uuid4().hex[:12]
+    map_dir = os.path.join(MAPS_DIR, mid)
+    os.makedirs(map_dir, exist_ok=True)
+    original = f"original{ext}"
+    with open(os.path.join(map_dir, original), "wb") as f:
+        while chunk := await file.read(1 << 20):
+            f.write(chunk)
+
+    page_count = 1
+    if ext == ".pdf":
+        import pypdfium2 as pdfium
+
+        try:
+            page_count = len(pdfium.PdfDocument(os.path.join(map_dir, original)))
+        except Exception as exc:
+            raise HTTPException(422, f"Could not read PDF: {exc}")
+    with open(os.path.join(map_dir, "map.json"), "w") as f:
+        json.dump({"original": original, "page_count": page_count}, f)
+    try:
+        meta = _render_map_page(map_dir, 1)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, f"Could not render the map image: {exc}")
+    return {"map_id": mid, "width": meta["width"], "height": meta["height"],
+            "page_count": page_count, "page": meta["page"]}
+
+
+class PageIn(BaseModel):
+    page: int
+
+
+@app.post("/api/maps/{mid}/page")
+def select_map_page(mid: str, body: PageIn):
+    meta = _render_map_page(_map_dir(mid), body.page)
+    return {"map_id": mid, "width": meta["width"], "height": meta["height"],
+            "page_count": meta["page_count"], "page": meta["page"]}
+
+
+@app.get("/api/maps/{mid}/image")
+def map_image(mid: str):
+    path = os.path.join(_map_dir(mid), "map.png")
+    if not os.path.exists(path):
+        raise HTTPException(404, "Map image not rendered")
+    return FileResponse(path, media_type="image/png")
+
+
+class GeorefIn(BaseModel):
+    epsg: int
+    points: list[dict]  # [{px, py, e, n}, ...]
+
+
+@app.post("/api/maps/{mid}/georef")
+def georef_map(mid: str, body: GeorefIn):
+    from . import georef as georef_mod
+
+    map_dir = _map_dir(mid)
+    with open(os.path.join(map_dir, "map.json")) as f:
+        meta = json.load(f)
+    try:
+        M, rms = georef_mod.fit(body.points)
+        corners = georef_mod.image_corners_wgs84(
+            M, meta["width"], meta["height"], body.epsg)
+    except georef_mod.GeorefError as exc:
+        raise HTTPException(422, str(exc))
+    except Exception as exc:
+        raise HTTPException(422, f"Georeferencing failed: {exc}")
+    result = {"corners": corners, "rms_m": round(rms, 2), "epsg": body.epsg,
+              "points": body.points,
+              "width": meta["width"], "height": meta["height"]}
+    with open(os.path.join(map_dir, "georef.json"), "w") as f:
+        json.dump(result, f)
+    return result
+
+
+@app.get("/api/maps/{mid}/georef")
+def get_map_georef(mid: str):
+    path = os.path.join(_map_dir(mid), "georef.json")
+    if not os.path.exists(path):
+        raise HTTPException(404, "Map not georeferenced yet")
+    with open(path) as f:
+        return JSONResponse(json.load(f))
+
+
+class AttachMapIn(BaseModel):
+    map_id: str
+
+
+@app.post("/api/projects/{pid}/attach-map")
+def attach_map(pid: str, body: AttachMapIn):
+    """Persist the map<->project link so re-opening the project can restore
+    the overlay (control points live in the map's georef.json)."""
+    _require_project(pid)
+    _map_dir(body.map_id)
+    with open(os.path.join(project_dir(pid), "map_ref.json"), "w") as f:
+        json.dump({"map_id": body.map_id}, f)
+    return {"ok": True}
+
+
+@app.get("/api/projects/{pid}/map")
+def project_map(pid: str):
+    _require_project(pid)
+    ref = os.path.join(project_dir(pid), "map_ref.json")
+    if not os.path.exists(ref):
+        raise HTTPException(404, "No map attached")
+    with open(ref) as f:
+        mid = json.load(f)["map_id"]
+    georef_path = os.path.join(_map_dir(mid), "georef.json")
+    out = {"map_id": mid, "georef": None}
+    if os.path.exists(georef_path):
+        with open(georef_path) as f:
+            out["georef"] = json.load(f)
+    return out

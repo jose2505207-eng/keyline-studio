@@ -75,3 +75,23 @@ def test_seam_blend_is_monotonic_no_cliff():
     # Blend weight is monotonic across the seam (east side, moving inward)
     inward = w[mid, c0:c0 + 10]
     assert np.all(np.diff(inward) >= -1e-9)
+
+
+def test_nodata_hole_does_not_bleed_into_blend():
+    """A nodata hole inside the drone footprint must fall back to satellite
+    exactly (weight 0), with the feather ramping around it — no NaN or bogus
+    values bleeding into the fused surface."""
+    sat, drone, (r0, r1, c0, c1), _ = _grids()
+    drone[45:55, 45:55] = np.nan  # sensor dropout hole inside the footprint
+
+    fused, w = fuse(sat, drone, CELL, FEATHER)
+
+    # fused is finite wherever the satellite is finite
+    assert np.isfinite(fused).all()
+    # the hole is pure satellite
+    assert np.allclose(fused[48:52, 48:52], sat[48:52, 48:52])
+    assert np.all(w[45:55, 45:55] == 0.0)
+    # weight ramps down toward the hole (no cliff at its rim)
+    mid = 50
+    ramp = w[mid, 40:45]  # approaching the hole from the west
+    assert np.all(np.diff(ramp) <= 1e-9)

@@ -91,16 +91,19 @@ def extract_stream_lines(
     facc: np.ndarray,
     dem: np.ndarray,
     transform: Affine,
-    threshold_frac: float = 0.01,
+    threshold_cells: float,
     min_length_m: float = 0.0,
 ) -> list[LineString]:
     """Threshold flow accumulation -> skeletonize -> vectorize.
 
-    Each returned polyline is oriented downstream -> upstream using the DEM
-    (first vertex is the lower end).
+    ``threshold_cells`` is a physically meaningful minimum contributing area
+    expressed in cells (the caller converts a drainage area in m² using the
+    grid's cell size) — not a fraction of the maximum accumulation, which
+    would silently scale with AOI size. Each returned polyline is oriented
+    downstream -> upstream using the DEM (first vertex is the lower end).
     """
     with np.errstate(invalid="ignore"):
-        mask = facc > (np.nanmax(facc) * threshold_frac)
+        mask = facc >= threshold_cells
     mask &= ~np.isnan(facc)
     if not mask.any():
         return []
@@ -226,6 +229,30 @@ def contour_at(dem: np.ndarray, transform: Affine, elevation: float,
                key=lambda line: line.length)
     smoothed = best.simplify(cell * 0.5, preserve_topology=False)
     return smoothed if isinstance(smoothed, LineString) else best
+
+
+def presmooth_dem(dem: np.ndarray, sigma_px: float) -> np.ndarray:
+    """NaN-aware Gaussian smooth (normalized convolution).
+
+    Applied to *satellite* DEMs before hydrological conditioning: GLO-30's
+    ~2-4 m vertical noise exceeds the pixel-to-pixel elevation signal on
+    gentle terrain, so unsmoothed D8 routing follows noise. This trades fine
+    detail for hydrological coherence — appropriate at 30 m resolution, and
+    deliberately never applied to uploaded drone DTMs finer than 5 m, whose
+    detail is real signal.
+    """
+    if sigma_px <= 0:
+        return dem
+    from scipy.ndimage import gaussian_filter
+
+    nan = np.isnan(dem)
+    filled = np.where(nan, 0.0, dem).astype("float64")
+    weight = (~nan).astype("float64")
+    num = gaussian_filter(filled, sigma_px)
+    den = gaussian_filter(weight, sigma_px)
+    out = (num / np.maximum(den, 1e-9)).astype("float32")
+    out[nan] = np.nan
+    return out
 
 
 def hillshade(dem: np.ndarray, cell_size: float, azimuth: float = 315.0,
