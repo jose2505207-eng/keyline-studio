@@ -67,21 +67,26 @@ export default function App() {
     map.addControl(new maplibregl.ScaleControl());
     mapRef.current = map;
 
-    const draw = new TerraDraw({
-      adapter: new TerraDrawMapLibreGLAdapter({ map }),
-      modes: [new TerraDrawPolygonMode()],
-    });
-    draw.start();
-    draw.setMode("static");
-    drawRef.current = draw;
-
-    draw.on("finish", (id) => {
-      const feat = draw.getSnapshot().find((f) => f.id === id);
+    // terra-draw registers its own map sources, which must wait until the
+    // style has finished loading (in production builds the style is still
+    // loading when this effect runs; starting early throws and blanks the app).
+    map.once("load", () => {
+      const draw = new TerraDraw({
+        adapter: new TerraDrawMapLibreGLAdapter({ map }),
+        modes: [new TerraDrawPolygonMode()],
+      });
+      draw.start();
       draw.setMode("static");
-      setDrawing(false);
-      if (feat && feat.geometry.type === "Polygon") {
-        void handleAoiDrawn(feat.geometry as GeoJSON.Polygon);
-      }
+      drawRef.current = draw;
+
+      draw.on("finish", (id) => {
+        const feat = draw.getSnapshot().find((f) => f.id === id);
+        draw.setMode("static");
+        setDrawing(false);
+        if (feat && feat.geometry.type === "Polygon") {
+          void handleAoiDrawn(feat.geometry as GeoJSON.Polygon);
+        }
+      });
     });
 
     setupKeypointInteractions(map);
