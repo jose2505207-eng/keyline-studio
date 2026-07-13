@@ -6,3 +6,5 @@ node_modules/
 dist/
 .pytest_cache/
 *.tsbuildinfo
+.vercel/
+.env*.local

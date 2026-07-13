@@ -30,6 +30,24 @@ keyline/                  (this repo — the "keyline-studio" monorepo)
   docker-compose.yml      optional convenience
 ```
 
+## Hosted frontend (Vercel)
+
+The frontend is deployed at
+**https://keyline-studio-jose2505207-engs-projects.vercel.app** (source:
+https://github.com/jose2505207-eng/keyline-studio). Vercel hosts the static
+frontend only — the geospatial backend (native WhiteboxTools binary,
+minutes-long jobs, on-disk SQLite/rasters) does not fit serverless. To use the
+hosted page, run the backend locally (below) and open:
+
+```
+https://keyline-studio-jose2505207-engs-projects.vercel.app/?api=http://localhost:8000
+```
+
+The `?api=` query param (or `VITE_API_BASE` at build time) points the frontend
+at any backend origin; the backend's CORS already allows `*.vercel.app`. To
+put the backend online too, deploy the `backend/` Docker image on a
+container host (Fly.io, Railway, a VPS…) and pass its URL in `?api=`.
+
 ## Running (bare, two dev servers)
 
 Backend (Python 3.11+; developed on 3.12):
