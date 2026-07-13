@@ -30,23 +30,25 @@ keyline/                  (this repo — the "keyline-studio" monorepo)
   docker-compose.yml      optional convenience
 ```
 
-## Hosted frontend (Vercel)
+## Hosted deployment
 
-The frontend is deployed at
-**https://keyline-studio-jose2505207-engs-projects.vercel.app** (source:
-https://github.com/jose2505207-eng/keyline-studio). Vercel hosts the static
-frontend only — the geospatial backend (native WhiteboxTools binary,
-minutes-long jobs, on-disk SQLite/rasters) does not fit serverless. To use the
-hosted page, run the backend locally (below) and open:
+The app is live at
+**https://keyline-studio-jose2505207-engs-projects.vercel.app**
+(source: https://github.com/jose2505207-eng/keyline-studio).
 
-```
-https://keyline-studio-jose2505207-engs-projects.vercel.app/?api=http://localhost:8000
-```
-
-The `?api=` query param (or `VITE_API_BASE` at build time) points the frontend
-at any backend origin; the backend's CORS already allows `*.vercel.app`. To
-put the backend online too, deploy the `backend/` Docker image on a
-container host (Fly.io, Railway, a VPS…) and pass its URL in `?api=`.
+- **Frontend**: static Vite build on Vercel. `VITE_API_BASE` (set on the
+  Vercel project) bakes in the backend URL; a `?api=<origin>` query param
+  overrides it at runtime (e.g. `?api=http://localhost:8000` to use a local
+  backend).
+- **Backend**: Docker web service on Render's free tier at
+  https://keyline-backend.onrender.com, auto-deployed from this repo's
+  `render.yaml` blueprint on pushes to `main`. Vercel can't host it — the
+  pipeline needs the native WhiteboxTools binary, minutes-long jobs, and
+  on-disk SQLite/rasters. Free-tier caveats: the instance spins down when
+  idle (first request after a pause takes ~1 min), storage is ephemeral
+  (results vanish on restart — re-run Analyze), and 512 MB RAM comfortably
+  fits satellite AOIs but may OOM on large high-resolution drone DEMs.
+  `backend/fly.toml` is included if you prefer Fly.io.
 
 ## Running (bare, two dev servers)
 
