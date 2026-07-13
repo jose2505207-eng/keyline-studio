@@ -3,7 +3,12 @@
 // deployment (e.g. static frontend on Vercel, backend elsewhere), set
 // VITE_API_BASE to the backend origin at build time.
 
-const API_BASE: string = import.meta.env.VITE_API_BASE ?? "";
+// Runtime override too: open the app as /?api=http://localhost:8000 to point
+// a hosted frontend at a backend running on your own machine.
+const API_BASE: string =
+  new URLSearchParams(window.location.search).get("api") ??
+  import.meta.env.VITE_API_BASE ??
+  "";
 
 function url(path: string): string {
   return `${API_BASE}${path}`;
