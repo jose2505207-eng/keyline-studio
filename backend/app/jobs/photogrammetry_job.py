@@ -273,11 +273,15 @@ def run_survey(survey_id: str) -> None:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def reconcile_stale_surveys(enqueue=None) -> list[str]:
+def reconcile_stale_surveys(enqueue=None, stale_seconds: float = 120.0) -> list[str]:
     """Called on startup: surveys stranded in active states by a crash are
     resumed (an external task exists → re-enqueue polling) or returned to a
     recoverable state (no external task yet → back to `uploaded`). Never
-    marks anything completed without evidence."""
+    marks anything completed without evidence.
+
+    A live worker touches the row every poll, so surveys updated within
+    ``stale_seconds`` are still owned by a running job and must not be
+    re-enqueued (that would start a duplicate polling job)."""
     if enqueue is None:
         from .queue import QueueUnavailable, enqueue_survey
 
@@ -291,6 +295,11 @@ def reconcile_stale_surveys(enqueue=None) -> list[str]:
     touched = []
     for survey in db.surveys_in_states(ACTIVE_STATES):
         sid = survey["id"]
+        age = time.time() - (survey.get("updated_at") or 0)
+        if age < stale_seconds:
+            log.info("reconcile: survey %s updated %.0fs ago — a worker "
+                     "still owns it, leaving alone", sid, age)
+            continue
         if survey.get("external_task_id"):
             log.info("reconcile: resuming survey %s (task %s)", sid,
                      survey["external_task_id"])

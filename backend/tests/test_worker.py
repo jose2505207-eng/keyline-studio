@@ -121,8 +121,15 @@ def test_reconciliation_resumes_or_recovers(drone_env):
                                external_task_id="ext-123")
     drone_env.db.update_survey(sid2, state="preflight")
 
+    # a worker that is still alive keeps updated_at fresh — reconciliation
+    # must leave those surveys alone (no duplicate polling job)
+    fresh = reconcile_stale_surveys(enqueue=lambda _s: None,
+                                    stale_seconds=120.0)
+    assert fresh == []
+
     enqueued = []
-    touched = reconcile_stale_surveys(enqueue=enqueued.append)
+    touched = reconcile_stale_surveys(enqueue=enqueued.append,
+                                      stale_seconds=0.0)
     assert set(touched) == {sid1, sid2}
     assert enqueued == [sid1]  # resumes polling of the existing task
     s2 = drone_env.db.get_survey(sid2)

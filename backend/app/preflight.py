@@ -83,7 +83,9 @@ def run_preflight(image_paths: list[tuple[str, str]], min_images: int,
             with Image.open(path) as img:
                 img.verify()
             with Image.open(path) as img:
-                if img.format != "JPEG":
+                # DJI (and many other drones) write MPO: a JPEG container
+                # with an embedded second image. ODM treats them as JPEGs.
+                if img.format not in ("JPEG", "MPO"):
                     raise ValueError(f"not a JPEG (got {img.format})")
                 dims = f"{img.width}x{img.height}"
                 exif = img.getexif()
@@ -99,8 +101,9 @@ def run_preflight(image_paths: list[tuple[str, str]], min_images: int,
         seen_hashes[digest] = name
 
         res.dimension_groups[dims] = res.dimension_groups.get(dims, 0) + 1
-        make = str(exif.get(_EXIF_MAKE, "")).strip()
-        model = str(exif.get(_EXIF_MODEL, "")).strip()
+        # some cameras (DJI) null-pad EXIF strings
+        make = str(exif.get(_EXIF_MAKE, "")).replace("\x00", "").strip()
+        model = str(exif.get(_EXIF_MODEL, "")).replace("\x00", "").strip()
         camera = (f"{make} {model}".strip()) or "unknown"
         res.cameras[camera] = res.cameras.get(camera, 0) + 1
         # get_ifd is the safe accessor; a raw int offset means no parsed GPS
