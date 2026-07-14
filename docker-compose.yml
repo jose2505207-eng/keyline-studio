@@ -1,14 +1,70 @@
-# Optional convenience — the app also runs bare with two dev servers
-# (see README). `docker compose up --build` then open http://localhost:5173
+# Full development stack: API + worker (same image), Redis, MinIO (S3),
+# NodeODM photogrammetry node, and the frontend dev server.
+#
+#   docker compose up --build
+#
+# Then open http://localhost:5173, draw an AOI, and upload drone photos.
+# NodeODM needs real CPU/RAM: expect a small dataset (~20-50 photos) to take
+# tens of minutes on a laptop.
 services:
   backend:
     build: ./backend
     ports:
       - "8000:8000"
     volumes:
-      - ./backend/data:/app/data
+      - backend-data:/app/data
     environment:
       - AWS_NO_SIGN_REQUEST=YES
+      - REDIS_URL=redis://redis:6379/0
+      - PHOTOGRAMMETRY_PROVIDER=nodeodm
+      - NODEODM_URL=http://nodeodm:3000
+      - NODEODM_TOKEN=${NODEODM_TOKEN:-}
+      - STORAGE_BACKEND=s3
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_PUBLIC_ENDPOINT_URL=http://localhost:9000
+      - S3_REGION=us-east-1
+      - S3_BUCKET=keyline-uploads
+      - S3_ACCESS_KEY_ID=${MINIO_ROOT_USER:-keyline}
+      - S3_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:-keyline-dev-secret}
+      - S3_SECURE=false
+      - DRONE_MIN_IMAGES=${DRONE_MIN_IMAGES:-20}
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:8000/docs')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build: ./backend  # same code image as the API — never inside FastAPI
+    command: rq worker keyline --url redis://redis:6379/0
+    volumes:
+      - backend-data:/app/data
+    environment:
+      - AWS_NO_SIGN_REQUEST=YES
+      - REDIS_URL=redis://redis:6379/0
+      - PHOTOGRAMMETRY_PROVIDER=nodeodm
+      - NODEODM_URL=http://nodeodm:3000
+      - NODEODM_TOKEN=${NODEODM_TOKEN:-}
+      - STORAGE_BACKEND=s3
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_REGION=us-east-1
+      - S3_BUCKET=keyline-uploads
+      - S3_ACCESS_KEY_ID=${MINIO_ROOT_USER:-keyline}
+      - S3_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:-keyline-dev-secret}
+      - S3_SECURE=false
+      - DRONE_MIN_IMAGES=${DRONE_MIN_IMAGES:-20}
+      - KEYLINE_HYDRO_ENGINE=${KEYLINE_HYDRO_ENGINE:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
 
   frontend:
     build: ./frontend
@@ -19,3 +75,61 @@ services:
     environment:
       # Vite dev proxy target inside the compose network
       - VITE_PROXY_TARGET=http://backend:8000
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API — presigned browser uploads go here
+      - "9001:9001"   # web console
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-keyline}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-keyline-dev-secret}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-keyline} $${MINIO_ROOT_PASSWORD:-keyline-dev-secret} &&
+      mc mb --ignore-existing local/keyline-uploads &&
+      echo 'bucket ready'
+      "
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-keyline}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-keyline-dev-secret}
+
+  nodeodm:
+    image: opendronemap/nodeodm:latest
+    ports:
+      - "3000:3000"   # NodeODM web UI + API
+    volumes:
+      - nodeodm-data:/var/www/data
+    # Photogrammetry is CPU/RAM heavy; tune to the host machine.
+    # deploy: { resources: { limits: { memory: 12g } } }
+
+volumes:
+  backend-data:
+  redis-data:
+  minio-data:
+  nodeodm-data:

@@ -474,3 +474,179 @@ body,
   font-size: 12px;
   line-height: 1.5;
 }
+
+/* ---- drone survey panel ---- */
+
+.terrain-source {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13px;
+  border-top: 1px solid #ddd;
+  padding-top: 8px;
+}
+
+.terrain-source label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.drone-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.drone-panel .muted,
+.muted {
+  color: #666;
+  font-size: 12px;
+}
+
+.small-note {
+  padding: 2px 0;
+}
+
+.dropzone {
+  border: 2px dashed #aaa;
+  border-radius: 8px;
+  padding: 14px 10px;
+  text-align: center;
+  cursor: pointer;
+  background: #fafafa;
+}
+
+.dropzone.over {
+  border-color: #2b6bd6;
+  background: #eef4ff;
+}
+
+.file-summary {
+  font-size: 12px;
+}
+
+.file-summary .warn,
+.drone-panel .warn {
+  color: #b3261e;
+  font-size: 12px;
+}
+
+.linkish {
+  background: none;
+  border: none;
+  color: #2b6bd6;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+  text-align: left;
+}
+
+.file-list {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 140px;
+  overflow-y: auto;
+  border: 1px solid #eee;
+  border-radius: 6px;
+}
+
+.file-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+  border-bottom: 1px solid #f3f3f3;
+}
+
+.file-list li .fname {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-list li.done {
+  color: #14691b;
+}
+
+.file-list li.error {
+  color: #b3261e;
+}
+
+.gcp-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.advanced {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  background: #f7f7f7;
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 12px;
+}
+
+.advanced label {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  align-items: center;
+}
+
+.advanced input {
+  width: 64px;
+  padding: 3px 5px;
+  border: 1px solid #bbb;
+  border-radius: 4px;
+}
+
+.survey-status {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.timeline {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: #999;
+}
+
+.timeline li {
+  padding: 1px 0;
+}
+
+.timeline li.done {
+  color: #14691b;
+}
+
+.timeline li.done::marker {
+  content: "✓ ";
+}
+
+.timeline li.current {
+  color: #1a1a1a;
+  font-weight: 700;
+}
+
+.drone-panel button.primary {
+  background: #2b6bd6;
+  color: #fff;
+  border-color: #2b6bd6;
+}
+
+.layers input[type="range"] {
+  width: 100%;
+  margin: 0 0 4px;
+}

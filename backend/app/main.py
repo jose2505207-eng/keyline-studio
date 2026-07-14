@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -31,6 +31,22 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup():
     db.init_db()
+    # Surveys stranded mid-flight by a crash/restart are resumed or returned
+    # to a recoverable state (never falsely completed).
+    try:
+        from .jobs import reconcile_stale_surveys
+
+        reconcile_stale_surveys()
+    except Exception as exc:  # noqa: BLE001 — startup must not die on this
+        import logging
+
+        logging.getLogger(__name__).warning("survey reconciliation failed: %s", exc)
+
+
+from . import surveys_api  # noqa: E402
+
+app.include_router(surveys_api.router)
+app.include_router(surveys_api.health_router)
 
 
 def project_dir(pid: str) -> str:
@@ -383,6 +399,79 @@ def attach_map(pid: str, body: AttachMapIn):
     with open(os.path.join(project_dir(pid), "map_ref.json"), "w") as f:
         json.dump({"map_id": body.map_id}, f)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Local-dev storage backend: accepts the "presigned" PUTs issued by
+# app.storage.local. Only active when STORAGE_BACKEND=local.
+
+
+@app.put("/api/local-uploads/{key:path}")
+async def local_upload(key: str, request: "Request"):
+    from . import config as cfg
+    from .storage import LocalStorage, StorageError, get_storage
+
+    storage = get_storage()
+    if not isinstance(storage, LocalStorage):
+        raise HTTPException(404, "Local upload endpoint is disabled")
+    body = await request.body()
+    if len(body) > cfg.drone_max_file_bytes():
+        raise HTTPException(413, "File exceeds the per-file limit")
+    try:
+        storage.put_bytes(key, body, request.headers.get("content-type",
+                                                         "application/octet-stream"))
+    except StorageError as exc:
+        raise HTTPException(422, str(exc))
+    return {"ok": True, "size": len(body)}
+
+
+# ---------------------------------------------------------------------------
+# Photogrammetry assets (orthophoto preview + original GeoTIFF downloads)
+
+
+def _photogrammetry_file(pid: str, filename: str) -> str:
+    path = os.path.join(project_dir(pid), "photogrammetry", filename)
+    if not os.path.exists(path):
+        raise HTTPException(404, f"{filename} not available for this project")
+    return path
+
+
+@app.get("/api/projects/{pid}/orthophoto")
+def orthophoto_preview(pid: str):
+    _require_project(pid)
+    from .assets import ensure_orthophoto_preview
+
+    tif = _photogrammetry_file(pid, "orthophoto.tif")
+    preview, _ = ensure_orthophoto_preview(
+        tif, os.path.join(project_dir(pid), "photogrammetry"))
+    return FileResponse(preview, media_type="image/png")
+
+
+@app.get("/api/projects/{pid}/orthophoto-bounds")
+def orthophoto_bounds(pid: str):
+    _require_project(pid)
+    from .assets import ensure_orthophoto_preview
+
+    tif = _photogrammetry_file(pid, "orthophoto.tif")
+    _, bounds = ensure_orthophoto_preview(
+        tif, os.path.join(project_dir(pid), "photogrammetry"))
+    return JSONResponse(bounds)
+
+
+@app.get("/api/projects/{pid}/assets/dtm")
+def download_dtm(pid: str):
+    _require_project(pid)
+    return FileResponse(_photogrammetry_file(pid, "drone_dtm.tif"),
+                        media_type="image/tiff",
+                        filename=f"keyline-{pid}-dtm.tif")
+
+
+@app.get("/api/projects/{pid}/assets/orthophoto")
+def download_orthophoto(pid: str):
+    _require_project(pid)
+    return FileResponse(_photogrammetry_file(pid, "orthophoto.tif"),
+                        media_type="image/tiff",
+                        filename=f"keyline-{pid}-orthophoto.tif")
 
 
 @app.get("/api/projects/{pid}/map")

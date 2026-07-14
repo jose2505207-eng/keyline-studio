@@ -26,6 +26,8 @@ def _conn() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    from . import migrations
+
     with _conn() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS projects (
@@ -43,6 +45,7 @@ def init_db() -> None:
             updated_at REAL NOT NULL
         );
         """)
+        migrations.migrate(c)
 
 
 def create_project(name: str, aoi: dict) -> str:
@@ -104,3 +107,77 @@ def latest_job(pid: str) -> dict | None:
     d = dict(row)
     d["log"] = json.loads(d["log"])
     return d
+
+
+# ---------------------------------------------------------------------------
+# Drone surveys
+
+_SURVEY_JSON_FIELDS = {"images_json", "options_json", "provider_status_json",
+                       "preflight_json", "warnings_json"}
+
+
+def _survey_row_to_dict(row) -> dict:
+    d = dict(row)
+    for f in _SURVEY_JSON_FIELDS:
+        if d.get(f) is not None:
+            try:
+                d[f] = json.loads(d[f])
+            except (TypeError, json.JSONDecodeError):
+                pass
+    return d
+
+
+def create_survey(project_id: str, images: list[dict], options: dict,
+                  total_bytes: int) -> str:
+    sid = uuid.uuid4().hex[:12]
+    now = time.time()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO drone_surveys (id, project_id, image_count, "
+            "total_bytes, images_json, options_json, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (sid, project_id, len(images), total_bytes,
+             json.dumps(images), json.dumps(options), now, now),
+        )
+    return sid
+
+
+def get_survey(sid: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM drone_surveys WHERE id=?", (sid,)).fetchone()
+    return _survey_row_to_dict(row) if row else None
+
+
+def list_surveys(project_id: str) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM drone_surveys WHERE project_id=? ORDER BY created_at DESC",
+            (project_id,),
+        ).fetchall()
+    return [_survey_row_to_dict(r) for r in rows]
+
+
+def update_survey(sid: str, **fields) -> None:
+    """Partial update; dict/list values in JSON columns are serialized."""
+    if not fields:
+        return
+    cols, vals = [], []
+    for k, v in fields.items():
+        if k in _SURVEY_JSON_FIELDS and isinstance(v, (dict, list)):
+            v = json.dumps(v)
+        cols.append(f"{k}=?")
+        vals.append(v)
+    cols.append("updated_at=?")
+    vals.append(time.time())
+    vals.append(sid)
+    with _conn() as c:
+        c.execute(f"UPDATE drone_surveys SET {', '.join(cols)} WHERE id=?", vals)
+
+
+def surveys_in_states(states: list[str]) -> list[dict]:
+    q = ",".join("?" for _ in states)
+    with _conn() as c:
+        rows = c.execute(
+            f"SELECT * FROM drone_surveys WHERE state IN ({q})", states
+        ).fetchall()
+    return [_survey_row_to_dict(r) for r in rows]

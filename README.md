@@ -12,6 +12,114 @@ overrides the satellite data within its footprint.
 > Union and ESA.** Candidate keypoints are computational suggestions — field
 > verification is required before any earthworks.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Browser
+        FE[React + MapLibre frontend]
+    end
+    subgraph API["FastAPI backend"]
+        R[REST routes]
+        DB[(SQLite)]
+    end
+    subgraph Jobs["RQ worker (separate process)"]
+        W[photogrammetry job]
+        T[terrain job]
+    end
+    S3[(S3 / MinIO<br/>drone photos)]
+    ODM[NodeODM node<br/>OpenDroneMap]
+    COP[Copernicus GLO-30<br/>public S3]
+
+    FE -->|REST| R
+    FE -->|presigned PUT| S3
+    R --> DB
+    R -->|enqueue| Q[(Redis)]
+    Q --> W
+    W -->|images| S3
+    W -->|create task / poll / download| ODM
+    W --> T
+    T -->|DTM analysis| DB
+    T -.->|satellite / fused modes| COP
+```
+
+## Terrain sources (three modes)
+
+| Mode | Trigger | What happens |
+|---|---|---|
+| **Drone photos** | Upload 20–500 geotagged JPGs | NodeODM builds a bare-earth DTM + orthophoto; keyline analysis runs on the DTM in **drone_only** mode (no Copernicus fetch, no satellite smoothing, no satellite reliability warnings) when it covers ≥ `DRONE_ONLY_MIN_AOI_COVERAGE` (default 98%) of the AOI |
+| **Existing DTM** | Upload a GeoTIFF | Same analysis; full-coverage DTMs also run drone_only, partial ones are **fused** with GLO-30 |
+| **Satellite preview** | Just press Analyze | Copernicus GLO-30 (**satellite_only**) — reconnaissance grade, ~4 m vertical error |
+
+The selected mode and drone coverage are recorded in the results metadata
+(`properties.dem_mode`, `properties.drone_coverage`). Photogrammetric output
+is reported as a *high-resolution candidate design* — the field-verification
+warning always applies; nothing here is construction-grade until surveyed on
+the ground.
+
+## Drone photo workflow
+
+1. Draw or import the property AOI.
+2. Terrain source → **Drone photos**: drop 100–500 geotagged JPG/JPEGs
+   (backend minimum is `DRONE_MIN_IMAGES`, default 20).
+3. Optionally attach an OpenDroneMap `gcp_list.txt` (validated: CRS header +
+   ≥3 control points).
+4. Upload — the browser PUTs each file straight to S3/MinIO with presigned
+   URLs (bounded concurrency, per-file retry); the API never proxies photos.
+5. The backend verifies every object and size, then **Start processing**
+   enqueues a durable RQ job.
+6. The worker: preflight (JPEG validity, duplicates, EXIF GPS count, camera
+   mix) → submits to NodeODM (`dtm=true`, `skip-3dmodel=true`, resolutions
+   from env) → persists the external task id immediately → polls status and
+   logs → downloads `odm_dem/dtm.tif` + `odm_orthophoto/odm_orthophoto.tif`
+   → validates them (CRS, plausible elevations, AOI coverage %) → writes
+   `backend/data/<project>/photogrammetry/{drone_dtm.tif, orthophoto.tif,
+   provider-output.log, manifest.json}` → runs the keyline pipeline.
+7. The UI shows an honest processing timeline (stages are only marked from
+   actual provider evidence), survives page refreshes (survey id persisted in
+   localStorage, state recovered from the API), and offers Cancel/Retry.
+   Retry never duplicates a still-existing NodeODM task.
+
+**Recovery**: on API startup, surveys stranded in active states are
+reconciled — resumed if an external task exists, otherwise returned to
+`uploaded` with an explanatory message. Nothing is ever marked completed
+without evidence. **Cancellation** stops the worker at the next stage
+boundary and cancels the provider task.
+
+**Data retention**: uploaded photos stay in object storage under
+`uploads/<project>/<survey>/…` until you delete them (`delete_prefix`);
+worker temp directories are removed in a `finally` block; provider logs and
+manifests are kept for troubleshooting.
+
+## Running the full stack (Docker Compose)
+
+```bash
+cp .env.example .env   # optional; defaults work
+docker compose up --build
+```
+
+Services: **backend** API (:8000), **worker** (same image, `rq worker`),
+**frontend** (:5173), **redis**, **minio** (:9000 S3 / :9001 console),
+**minio-init** (creates the bucket), **nodeodm** (:3000). Named volumes
+persist projects, Redis, MinIO objects, and NodeODM data.
+
+**NodeODM requirements**: photogrammetry is heavy — budget roughly 1 GB RAM
+per 10–20 images and many CPU-minutes; a 300-photo survey can take hours.
+A small free-tier web instance (like the hosted Render backend) **cannot**
+run NodeODM; it can only *talk to* one. To use an external node (a beefy VPS,
+a lab machine, or a Lightning/paid ODM node), point the backend at it:
+
+```
+NODEODM_URL=https://your-node.example.com:3000
+NODEODM_TOKEN=your-token        # if the node requires one
+```
+
+`GET /api/photogrammetry/health` reports provider reachability/version
+without exposing the token. The hosted deployment topology is therefore:
+Vercel (static frontend) → Render or any host (API + worker) → external
+Redis + S3 + NodeODM. The API host itself stays small; the NodeODM node
+carries the compute.
+
 ## Layout
 
 ```
@@ -257,6 +365,25 @@ asking for each contour's label), and surface interpolation between contours.
 That chain is inherently less accurate than obtaining the surveyor's original
 DTM GeoTIFF, which this tool already accepts — so it is deliberately out of
 scope. OCR of printed grid labels is likewise out of scope.
+
+## DTM vs DSM
+
+A **DTM** (digital terrain model) is bare earth; a **DSM** (digital surface
+model) includes vegetation and buildings. Keyline design needs ground shape,
+so the drone workflow requests ODM's ground-classified DTM (`dtm=true`,
+SMRF classification) — never the DSM — and the manual upload path labels the
+distinction explicitly. GLO-30 satellite data is inherently a DSM, which is
+one of the reasons it is reconnaissance-grade only.
+
+## Environment variables
+
+Every variable ships with a safe development default — see
+[.env.example](.env.example) for the full annotated list: photogrammetry
+provider (`PHOTOGRAMMETRY_PROVIDER`, `NODEODM_URL`, `NODEODM_TOKEN`, …), ODM
+task defaults (`ODM_*`), Redis (`REDIS_URL`), object storage (`STORAGE_BACKEND`,
+`S3_*` incl. `S3_PUBLIC_ENDPOINT_URL` for presigned browser URLs behind
+docker), upload limits (`DRONE_*`), and the drone-only coverage threshold
+(`DRONE_ONLY_MIN_AOI_COVERAGE`).
 
 ## Known limitations
 

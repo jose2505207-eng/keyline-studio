@@ -264,10 +264,68 @@ def _write_outputs(project_dir: str, dem_da: xr.DataArray, result: TerrainResult
     return fc
 
 
+def select_dem_mode(drone_path: str | None, aoi_geojson: dict,
+                    requested: str = "auto") -> tuple[str, float | None]:
+    """Pick satellite_only | drone_only | fused and report drone coverage.
+
+    A drone DTM covering at least DRONE_ONLY_MIN_AOI_COVERAGE of the AOI is
+    analyzed alone — Copernicus is not fetched just to be upsampled beneath
+    a complete high-resolution DTM. Partial coverage falls back to fusion.
+    """
+    if requested not in ("auto", "satellite_only", "drone_only", "fused"):
+        raise ValueError(f"Unknown dem_mode {requested!r}")
+    if not drone_path:
+        if requested in ("drone_only", "fused"):
+            raise ValueError(f"dem_mode={requested} requires a drone DTM")
+        return "satellite_only", None
+    from .assets import dtm_aoi_coverage
+
+    coverage = dtm_aoi_coverage(drone_path, aoi_geojson)
+    if requested != "auto":
+        return requested, coverage
+    from . import config as _config
+
+    if coverage >= _config.drone_only_min_aoi_coverage():
+        return "drone_only", coverage
+    return "fused", coverage
+
+
+def _prepare_drone_only_grid(drone_path: str, aoi_wgs, utm_crs: str,
+                             progress: Callable[[str], None]):
+    """Clip the drone DTM to the AOI (+ small routing buffer), reproject to
+    the analysis CRS, and coarsen only if the memory guard demands it.
+    No Gaussian smoothing: high-resolution drone detail is real signal."""
+    from rasterio.enums import Resampling
+
+    progress("preparing drone DTM (drone-only mode)")
+    drone = rioxarray.open_rasterio(drone_path, masked=True).squeeze(
+        "band", drop=True)
+
+    to_drone = Transformer.from_crs("EPSG:4326", drone.rio.crs,
+                                    always_xy=True).transform
+    aoi_in_drone = shp_transform(to_drone, aoi_wgs)
+    buffer = 30.0 if getattr(drone.rio.crs, "is_projected", True) else 30.0 / 111_320
+    clipped = drone.rio.clip([aoi_in_drone.buffer(buffer).__geo_interface__],
+                             all_touched=True, drop=True)
+
+    drone_utm = clipped.rio.reproject(utm_crs, resampling=Resampling.bilinear,
+                                      nodata=np.nan)
+    native_res = abs(drone_utm.rio.transform().a)
+    cells = drone_utm.sizes["x"] * drone_utm.sizes["y"]
+    if cells > MAX_GRID_CELLS:
+        target = native_res * float(np.sqrt(cells / MAX_GRID_CELLS))
+        progress(f"coarsening drone DTM to {target:.2f} m (memory guard)")
+        drone_utm = clipped.rio.reproject(utm_crs, resolution=target,
+                                          resampling=Resampling.bilinear,
+                                          nodata=np.nan)
+    return drone_utm.where(np.abs(drone_utm) < 1e10)
+
+
 def run_pipeline(project_dir: str, aoi_geojson: dict,
                  drone_path: str | None = None,
                  progress: Callable[[str], None] = lambda s: None,
-                 params: Params = Params()) -> dict:
+                 params: Params = Params(),
+                 dem_mode: str = "auto") -> dict:
     """Full pipeline for a project. Returns the result FeatureCollection."""
     aoi = shape(aoi_geojson)
 
@@ -279,64 +337,88 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
             f"AOI is {area_km2:.1f} km² — the limit is {MAX_AOI_KM2:.0f} km². "
             "Draw a smaller area.")
 
-    # --- fetch (padded bbox)
-    progress("fetching Copernicus GLO-30 elevation")
-    w, s, e, n = aoi.bounds
-    pw, ph = (e - w) * BBOX_PAD_FRAC, (n - s) * BBOX_PAD_FRAC
-    sat = dem_source.fetch_glo30(w - pw, s - ph, e + pw, n + ph)
+    dem_mode, drone_coverage = select_dem_mode(drone_path, aoi_geojson, dem_mode)
 
-    # --- reproject to local UTM
-    progress(f"reprojecting to {utm_crs}")
     from rasterio.enums import Resampling
-    sat_utm = sat.rio.reproject(utm_crs, resampling=Resampling.bilinear)
-    sat_utm = sat_utm.where(np.abs(sat_utm) < 1e10)
 
-    # --- honest data-quality guard, on the raw (unsmoothed) satellite DEM
-    progress("checking terrain relief vs satellite vertical error")
-    try:
-        aoi_clip = sat_utm.rio.clip([aoi_utm.__geo_interface__], all_touched=True)
-        clip_values = aoi_clip.values
-    except Exception:  # degenerate AOIs — fall back to the padded grid
-        clip_values = sat_utm.values
-    quality = assess_terrain_quality(np.asarray(clip_values, dtype="float32"),
-                                     has_drone=bool(drone_path), params=params)
+    if dem_mode == "drone_only":
+        dem_da = _prepare_drone_only_grid(drone_path, aoi, utm_crs, progress)
+        dem = dem_da.values.astype("float32")
+        if np.isnan(dem).all():
+            raise ValueError("The drone DTM has no valid data over the AOI.")
+        dem_da = dem_da.copy(data=dem)
+        # every cell is drone-derived; terrain-quality metrics come from the
+        # DTM itself (no satellite warning/suppression applies)
+        drone_weight = np.where(np.isfinite(dem), 1.0, 0.0).astype("float32")
+        try:
+            aoi_clip = dem_da.rio.clip([aoi_utm.__geo_interface__],
+                                       all_touched=True)
+            clip_values = aoi_clip.values
+        except Exception:
+            clip_values = dem
+        quality = assess_terrain_quality(
+            np.asarray(clip_values, dtype="float32"), has_drone=True,
+            params=params)
+    else:
+        # --- fetch (padded bbox)
+        progress("fetching Copernicus GLO-30 elevation")
+        w, s, e, n = aoi.bounds
+        pw, ph = (e - w) * BBOX_PAD_FRAC, (n - s) * BBOX_PAD_FRAC
+        sat = dem_source.fetch_glo30(w - pw, s - ph, e + pw, n + ph)
 
-    # --- satellite pre-smooth at native resolution (never the drone raster)
-    if params.smooth_sigma_px > 0:
-        progress("smoothing satellite DEM (noise suppression)")
-        sat_utm = sat_utm.copy(
-            data=terrain.presmooth_dem(
-                sat_utm.values.astype("float32"), params.smooth_sigma_px))
+        # --- reproject to local UTM
+        progress(f"reprojecting to {utm_crs}")
+        sat_utm = sat.rio.reproject(utm_crs, resampling=Resampling.bilinear)
+        sat_utm = sat_utm.where(np.abs(sat_utm) < 1e10)
 
-    drone_weight = None
-    dem_da = sat_utm
-    if drone_path:
-        progress("fusing drone DEM")
-        drone = rioxarray.open_rasterio(drone_path, masked=True).squeeze("band", drop=True)
-        drone_utm = drone.rio.reproject(utm_crs, resampling=Resampling.bilinear)
-        drone_res = abs(drone_utm.rio.transform().a)
-        sat_res = abs(sat_utm.rio.transform().a)
-        # Single common grid at the finer resolution over the whole AOI,
-        # capped so the grid stays in memory.
-        target_res = max(drone_res, np.sqrt((sat_utm.sizes["x"] * sat_res) *
-                                            (sat_utm.sizes["y"] * sat_res) /
-                                            MAX_GRID_CELLS))
-        if target_res < sat_res:
-            base = sat_utm.rio.reproject(utm_crs, resolution=target_res,
-                                         resampling=Resampling.bilinear)
-            base = base.where(np.abs(base) < 1e10)
-        else:
-            base = sat_utm
-        drone_arr = fusion.reproject_drone_to_grid(drone_utm, base)
-        fused, drone_weight = fusion.fuse(
-            base.values.astype("float32"), drone_arr,
-            cell_size=abs(base.rio.transform().a))
-        dem_da = base.copy(data=fused)
+        # --- honest data-quality guard, on the raw (unsmoothed) satellite DEM
+        progress("checking terrain relief vs satellite vertical error")
+        try:
+            aoi_clip = sat_utm.rio.clip([aoi_utm.__geo_interface__],
+                                        all_touched=True)
+            clip_values = aoi_clip.values
+        except Exception:  # degenerate AOIs — fall back to the padded grid
+            clip_values = sat_utm.values
+        quality = assess_terrain_quality(
+            np.asarray(clip_values, dtype="float32"),
+            has_drone=(dem_mode == "fused"), params=params)
 
-    dem = dem_da.values.astype("float32")
-    if np.isnan(dem).all():
-        raise ValueError("The AOI contains no elevation data.")
-    dem_da = dem_da.copy(data=dem)
+        # --- satellite pre-smooth at native resolution (never the drone raster)
+        if params.smooth_sigma_px > 0:
+            progress("smoothing satellite DEM (noise suppression)")
+            sat_utm = sat_utm.copy(
+                data=terrain.presmooth_dem(
+                    sat_utm.values.astype("float32"), params.smooth_sigma_px))
+
+        drone_weight = None
+        dem_da = sat_utm
+        if dem_mode == "fused":
+            progress("fusing drone DEM")
+            drone = rioxarray.open_rasterio(drone_path, masked=True).squeeze("band", drop=True)
+            drone_utm = drone.rio.reproject(utm_crs, resampling=Resampling.bilinear)
+            drone_res = abs(drone_utm.rio.transform().a)
+            sat_res = abs(sat_utm.rio.transform().a)
+            # Single common grid at the finer resolution over the whole AOI,
+            # capped so the grid stays in memory.
+            target_res = max(drone_res, np.sqrt((sat_utm.sizes["x"] * sat_res) *
+                                                (sat_utm.sizes["y"] * sat_res) /
+                                                MAX_GRID_CELLS))
+            if target_res < sat_res:
+                base = sat_utm.rio.reproject(utm_crs, resolution=target_res,
+                                             resampling=Resampling.bilinear)
+                base = base.where(np.abs(base) < 1e10)
+            else:
+                base = sat_utm
+            drone_arr = fusion.reproject_drone_to_grid(drone_utm, base)
+            fused, drone_weight = fusion.fuse(
+                base.values.astype("float32"), drone_arr,
+                cell_size=abs(base.rio.transform().a))
+            dem_da = base.copy(data=fused)
+
+        dem = dem_da.values.astype("float32")
+        if np.isnan(dem).all():
+            raise ValueError("The AOI contains no elevation data.")
+        dem_da = dem_da.copy(data=dem)
 
     # --- terrain analysis (steps 4-9); suppressed entirely when the terrain
     # signal is below the satellite noise floor (hillshade still produced)
@@ -362,6 +444,12 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
                             "warning": quality["warning"],
                             "relief_m": quality["relief_m"],
                             "keylines_suppressed": quality["suppress"],
+                            "dem_mode": dem_mode,
+                            "drone_coverage": (round(drone_coverage, 4)
+                                               if drone_coverage is not None
+                                               else None),
+                            "dem_resolution_m": round(
+                                abs(dem_da.rio.transform().a), 3),
                         })
     return fc
 

@@ -3,7 +3,26 @@ import maplibregl from "maplibre-gl";
 import { TerraDraw, TerraDrawPolygonMode } from "terra-draw";
 import { TerraDrawMapLibreGLAdapter } from "terra-draw-maplibre-gl-adapter";
 import * as api from "./api";
+import DroneSurveyPanel from "./DroneSurveyPanel";
 import GeorefModal from "./GeorefModal";
+
+const STORAGE_KEY = "keyline.active";
+
+interface PersistedSession {
+  projectId: string | null;
+  surveyId: string | null;
+  aoi: GeoJSON.Polygon | null;
+}
+
+function loadSession(): PersistedSession {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw) as PersistedSession;
+  } catch {
+    /* corrupted storage — start fresh */
+  }
+  return { projectId: null, surveyId: null, aoi: null };
+}
 
 const COLORS = {
   valley: "#3b82f6",
@@ -64,6 +83,11 @@ export default function App() {
   const [warning, setWarning] = useState<string | null>(null);
   const [droneInfo, setDroneInfo] = useState<api.DroneInfo | null>(null);
   const [isDsm, setIsDsm] = useState(false);
+  const [terrainSource, setTerrainSource] = useState<"drone" | "dtm" | "satellite">("satellite");
+  const [surveyId, setSurveyId] = useState<string | null>(null);
+  const [orthoInfo, setOrthoInfo] = useState<api.OrthophotoInfo | null>(null);
+  const [orthoVisible, setOrthoVisible] = useState(true);
+  const [orthoOpacity, setOrthoOpacity] = useState(0.9);
   const [exportOpen, setExportOpen] = useState(false);
   const [mapMeta, setMapMeta] = useState<api.MapMeta | null>(null);
   const [scanOverlay, setScanOverlay] = useState<{
@@ -210,6 +234,44 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // -------------------------------------------- session persistence/recovery
+  const aoiRef = useRef<GeoJSON.Polygon | null>(null);
+
+  useEffect(() => {
+    const session = loadSession();
+    if (!session.projectId) return;
+    setProjectId(session.projectId);
+    setSurveyId(session.surveyId);
+    if (session.surveyId) setTerrainSource("drone");
+    aoiRef.current = session.aoi;
+    const map = mapRef.current;
+    const restore = () => {
+      if (session.aoi) {
+        setAoiOnMap(session.aoi);
+        setAreaKm2(ringAreaKm2(session.aoi.coordinates[0] as [number, number][]));
+        flyToPolygon(session.aoi);
+      }
+      // restore finished results if the backend still has them
+      void (async () => {
+        try {
+          await loadOrthophoto(session.projectId!);
+          await loadResults(session.projectId!);
+        } catch {
+          /* no results yet — fine */
+        }
+      })();
+    };
+    if (map?.isStyleLoaded()) restore();
+    else map?.once("load", restore);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      projectId, surveyId, aoi: aoiRef.current,
+    } satisfies PersistedSession));
+  }, [projectId, surveyId]);
 
   const setAoiOnMap = (poly: GeoJSON.Polygon | null) => {
     const src = mapRef.current?.getSource("aoi") as
@@ -406,10 +468,13 @@ export default function App() {
   // ----------------------------------------------------------- AOI / project
   const handleAoiDrawn = useCallback(async (aoi: GeoJSON.Polygon) => {
     clearResults();
+    removeOrthoLayer();
     setDroneName(null);
     setDroneInfo(null);
     setDroneFootprint(null);
     setIsDsm(false);
+    setSurveyId(null);
+    aoiRef.current = aoi;
     setJobState("");
     setJobLog([]);
     try {
@@ -490,6 +555,58 @@ export default function App() {
     }
   };
   useEffect(() => stopPolling, []);
+
+  // ------------------------------------------------------------ orthophoto
+  const removeOrthoLayer = () => {
+    const map = mapRef.current;
+    if (map?.getLayer("orthophoto")) map.removeLayer("orthophoto");
+    if (map?.getSource("orthophoto")) map.removeSource("orthophoto");
+    setOrthoInfo(null);
+  };
+
+  const loadOrthophoto = async (pid: string) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const info = await api.getOrthophoto(pid);
+    if (!info) return;
+    if (map.getLayer("orthophoto")) map.removeLayer("orthophoto");
+    if (map.getSource("orthophoto")) map.removeSource("orthophoto");
+    map.addSource("orthophoto", {
+      type: "image",
+      url: info.url,
+      coordinates: info.coordinates as [
+        [number, number], [number, number],
+        [number, number], [number, number]
+      ],
+    });
+    // ordering: basemap < orthophoto < hillshade < vectors < AOI editing
+    const before = map.getLayer("hillshade") ? "hillshade"
+      : map.getLayer("aoi-fill") ? "aoi-fill" : undefined;
+    map.addLayer({
+      id: "orthophoto",
+      type: "raster",
+      source: "orthophoto",
+      layout: { visibility: orthoVisible ? "visible" : "none" },
+      paint: { "raster-opacity": orthoOpacity },
+    }, before);
+    setOrthoInfo(info);
+  };
+
+  const surveyCompleted = async () => {
+    if (!projectId) return;
+    clearResults();
+    try {
+      await loadOrthophoto(projectId);
+    } catch {
+      /* orthophoto optional */
+    }
+    try {
+      await loadResults(projectId);
+      setJobState("done");
+    } catch (err) {
+      setJobState(`error:${(err as Error).message}`);
+    }
+  };
 
   // ---------------------------------------------------------------- results
   const loadResults = async (pid: string) => {
@@ -820,44 +937,90 @@ export default function App() {
             {areaTooBig ? ` — exceeds the ${MAX_AOI_KM2} km² limit` : ""}
           </div>
         )}
-        <button
-          disabled={!projectId || busy}
-          onClick={() => fileInputRef.current?.click()}
-        >
-          ⛰ Upload DTM (bare-earth) GeoTIFF{" "}
-          {droneName ? `✓ ${droneName}` : "(optional)"}
-        </button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".tif,.tiff,image/tiff"
-          style={{ display: "none" }}
-          onChange={onDroneFile}
-        />
-        {droneInfo && (
-          <div className="drone-info">
-            {droneInfo.crs} · {droneInfo.resolution_m[0]} m/px ·{" "}
-            {droneInfo.elevation_range_m[0]}–{droneInfo.elevation_range_m[1]} m —
-            footprint shown in orange; confirm it lands on your parcel.
-            <label>
-              <input
-                type="checkbox"
-                checked={isDsm}
-                onChange={(e) => setIsDsm(e.target.checked)}
-              />
-              This file is a DSM (includes vegetation)
-            </label>
-            {isDsm && (
-              <div className="dsm-note">
-                Note: vegetation and structures in a DSM will distort valleys
-                and keylines — a bare-earth DTM gives design-grade results.
+        <div className="terrain-source">
+          <b>Terrain source</b>
+          <label>
+            <input type="radio" name="tsource"
+              checked={terrainSource === "drone"}
+              onChange={() => setTerrainSource("drone")} />
+            Drone photos — process a new survey
+          </label>
+          <label>
+            <input type="radio" name="tsource"
+              checked={terrainSource === "dtm"}
+              onChange={() => setTerrainSource("dtm")} />
+            Existing DTM — upload a GeoTIFF
+          </label>
+          <label>
+            <input type="radio" name="tsource"
+              checked={terrainSource === "satellite"}
+              onChange={() => setTerrainSource("satellite")} />
+            Satellite preview — Copernicus GLO-30
+          </label>
+        </div>
+
+        {terrainSource === "drone" && (
+          <DroneSurveyPanel
+            projectId={projectId}
+            initialSurveyId={surveyId}
+            onSurveyCreated={setSurveyId}
+            onCompleted={() => void surveyCompleted()}
+            onError={(msg) => setJobState(`error:${msg}`)}
+          />
+        )}
+
+        {terrainSource === "dtm" && (
+          <>
+            <button
+              disabled={!projectId || busy}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              ⛰ Upload DTM (bare-earth) GeoTIFF{" "}
+              {droneName ? `✓ ${droneName}` : ""}
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".tif,.tiff,image/tiff"
+              style={{ display: "none" }}
+              onChange={onDroneFile}
+            />
+            {droneInfo && (
+              <div className="drone-info">
+                {droneInfo.crs} · {droneInfo.resolution_m[0]} m/px ·{" "}
+                {droneInfo.elevation_range_m[0]}–{droneInfo.elevation_range_m[1]} m —
+                footprint shown in orange; confirm it lands on your parcel.
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={isDsm}
+                    onChange={(e) => setIsDsm(e.target.checked)}
+                  />
+                  This file is a DSM (includes vegetation)
+                </label>
+                {isDsm && (
+                  <div className="dsm-note">
+                    Note: vegetation and structures in a DSM will distort valleys
+                    and keylines — a bare-earth DTM gives design-grade results.
+                  </div>
+                )}
               </div>
             )}
+          </>
+        )}
+
+        {terrainSource === "satellite" && (
+          <div className="muted small-note">
+            30 m satellite terrain — reconnaissance-grade only (~4 m vertical
+            error).
           </div>
         )}
-        <button disabled={!projectId || busy || areaTooBig} onClick={analyze}>
-          ▶ Analyze
-        </button>
+
+        {terrainSource !== "drone" && (
+          <button disabled={!projectId || busy || areaTooBig} onClick={analyze}>
+            ▶ Analyze
+          </button>
+        )}
         <div className="export-wrap">
           <button
             disabled={!hasResults}
@@ -906,8 +1069,40 @@ export default function App() {
           </div>
         )}
 
-        {hasResults && (
+        {(hasResults || orthoInfo) && (
           <div className="layers">
+            {orthoInfo && (
+              <>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={orthoVisible}
+                    onChange={() => {
+                      const next = !orthoVisible;
+                      setOrthoVisible(next);
+                      mapRef.current?.setLayoutProperty(
+                        "orthophoto", "visibility",
+                        next ? "visible" : "none");
+                    }}
+                  />
+                  <span className="swatch" style={{ background: "#4a7a4a" }} />
+                  Orthophoto
+                </label>
+                {orthoVisible && (
+                  <input
+                    type="range" min={0} max={1} step={0.05}
+                    value={orthoOpacity}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      setOrthoOpacity(v);
+                      mapRef.current?.setPaintProperty(
+                        "orthophoto", "raster-opacity", v);
+                    }}
+                  />
+                )}
+              </>
+            )}
+            {hasResults && (
             <label>
               <input
                 type="checkbox"
@@ -917,6 +1112,8 @@ export default function App() {
               <span className="swatch" style={{ background: "#888" }} />
               Hillshade
             </label>
+            )}
+            {hasResults && (<>
             <label>
               <input
                 type="checkbox"
@@ -956,6 +1153,7 @@ export default function App() {
               />
               Keypoints (solid = drone, hollow = satellite)
             </label>
+            </>)}
           </div>
         )}
       </div>
