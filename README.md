@@ -135,12 +135,46 @@ The live Vercel app runs the drone workflow with zero paid services:
   `/api/local-uploads/…` endpoint onto ephemeral disk — fine for demo
   surveys; switch to S3 for production datasets (uploads are lost on
   instance restart, re-upload and retry).
-- **NodeODM through a tunnel**: any machine running
+- **NodeODM through a self-healing tunnel**: any machine running
   `docker run -p 3000:3000 opendronemap/nodeodm` can serve as the processing
-  node, exposed with e.g. `cloudflared tunnel --url http://localhost:3000`.
-  Quick-tunnel URLs are ephemeral — when the tunnel restarts, update
-  `NODEODM_URL` in the Render dashboard. Photogrammetry only works while
-  that node is up; everything else (satellite, manual DTM) is unaffected.
+  node, exposed with a cloudflared quick tunnel. Quick-tunnel URLs change on
+  every restart, so `scripts/keyline-tunnel.sh` runs the tunnel *and* keeps
+  the backend pointed at it: on startup (and every 5 minutes as a heartbeat)
+  it POSTs the current URL to `POST /api/admin/provider-url`, a token-guarded
+  endpoint that verifies the URL answers as a live NodeODM before persisting
+  it as a runtime override of `NODEODM_URL`. Setup on the node machine:
+
+  ```bash
+  mkdir -p ~/.config/keyline && chmod 700 ~/.config/keyline
+  cat > ~/.config/keyline/tunnel.env <<EOF
+  BACKEND_URL=https://keyline-backend.onrender.com
+  ADMIN_TOKEN=<same random value as the backend's ADMIN_TOKEN env var>
+  EOF
+  chmod 600 ~/.config/keyline/tunnel.env
+
+  # systemd user service: restarts the tunnel forever, survives reboots
+  mkdir -p ~/.config/systemd/user
+  cat > ~/.config/systemd/user/keyline-tunnel.service <<EOF
+  [Unit]
+  Description=Keyline NodeODM tunnel + URL sync
+  After=network-online.target
+  [Service]
+  ExecStart=%h/keyline/scripts/keyline-tunnel.sh
+  Restart=always
+  RestartSec=10
+  [Install]
+  WantedBy=default.target
+  EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now keyline-tunnel
+  loginctl enable-linger $USER   # start at boot without a login session
+  ```
+
+  The heartbeat also repairs the backend after *its* restarts (the override
+  lives on ephemeral disk). If the tunnel machine is down, photogrammetry
+  pauses; satellite and manual-DTM analysis are unaffected. For a URL that
+  never changes at all, use a Cloudflare named tunnel on your own domain or
+  an ngrok static domain and set `NODEODM_URL` once.
 
 ## Layout
 

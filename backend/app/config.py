@@ -36,7 +36,31 @@ def photogrammetry_provider() -> str:
     return os.environ.get("PHOTOGRAMMETRY_PROVIDER", "nodeodm")
 
 
+def data_dir() -> str:
+    return os.environ.get(
+        "KEYLINE_DATA",
+        os.path.join(os.path.dirname(__file__), "..", "data"),
+    )
+
+
+def provider_url_override_path() -> str:
+    return os.path.join(data_dir(), "provider_url.json")
+
+
 def nodeodm_url() -> str:
+    """Provider URL: a runtime override (set through the admin endpoint by
+    the tunnel-sync script) wins over the NODEODM_URL env var. Quick-tunnel
+    URLs change on every restart; this keeps the hosted backend pointed at
+    the live tunnel without a redeploy."""
+    try:
+        with open(provider_url_override_path()) as f:
+            import json
+
+            url = json.load(f).get("url", "")
+            if url:
+                return url
+    except (OSError, ValueError):
+        pass
     return os.environ.get("NODEODM_URL", "http://localhost:3000")
 
 

@@ -402,6 +402,47 @@ def attach_map(pid: str, body: AttachMapIn):
 
 
 # ---------------------------------------------------------------------------
+# Admin: runtime provider-URL update (used by the self-healing tunnel script).
+# Guarded by ADMIN_TOKEN; the candidate URL must answer as a live NodeODM
+# before it is applied, so a typo or dead tunnel can never be persisted.
+
+
+class ProviderUrlIn(BaseModel):
+    url: str
+
+
+@app.post("/api/admin/provider-url")
+def set_provider_url(body: ProviderUrlIn, request: Request):
+    import re
+    import secrets as _secrets
+
+    from . import config as cfg
+
+    token = os.environ.get("ADMIN_TOKEN", "")
+    supplied = request.headers.get("x-admin-token", "")
+    if not token or not _secrets.compare_digest(supplied, token):
+        raise HTTPException(403, "Admin token missing or invalid")
+    if not re.fullmatch(r"https?://[A-Za-z0-9.-]+(:\d+)?/?", body.url):
+        raise HTTPException(422, "Not a plain http(s) origin URL")
+    url = body.url.rstrip("/")
+
+    from .photogrammetry.nodeodm import NodeOdmProvider
+
+    health = NodeOdmProvider(url=url, token=cfg.nodeodm_token(),
+                             timeout=20).health()
+    if not health.ok:
+        raise HTTPException(
+            422, f"URL does not answer as a NodeODM node: {health.error}")
+
+    path = cfg.provider_url_override_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"url": url, "updated_at": __import__("time").time()}, f)
+    return {"ok": True, "url": url, "version": health.version,
+            "engine": health.engine}
+
+
+# ---------------------------------------------------------------------------
 # Local-dev storage backend: accepts the "presigned" PUTs issued by
 # app.storage.local. Only active when STORAGE_BACKEND=local.
 

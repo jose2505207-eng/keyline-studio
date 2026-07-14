@@ -8,6 +8,7 @@
 # tens of minutes on a laptop.
 services:
   backend:
+    restart: unless-stopped
     build: ./backend
     ports:
       - "8000:8000"
@@ -41,6 +42,7 @@ services:
       retries: 5
 
   worker:
+    restart: unless-stopped
     build: ./backend  # same code image as the API — never inside FastAPI
     command: rq worker keyline --url redis://redis:6379/0
     volumes:
@@ -67,6 +69,7 @@ services:
         condition: service_completed_successfully
 
   frontend:
+    restart: unless-stopped
     build: ./frontend
     ports:
       - "5173:5173"
@@ -77,6 +80,7 @@ services:
       - VITE_PROXY_TARGET=http://backend:8000
 
   redis:
+    restart: unless-stopped
     image: redis:7-alpine
     command: redis-server --appendonly yes
     volumes:
@@ -88,6 +92,7 @@ services:
       retries: 10
 
   minio:
+    restart: unless-stopped
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     ports:
@@ -120,6 +125,7 @@ services:
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-keyline-dev-secret}
 
   nodeodm:
+    restart: unless-stopped
     image: opendronemap/nodeodm:latest
     ports:
       - "3000:3000"   # NodeODM web UI + API
