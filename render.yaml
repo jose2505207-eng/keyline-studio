@@ -1,6 +1,18 @@
-# Render Blueprint — deploys the backend as a Docker web service.
+# Render Blueprint — backend web service + free Key Value (Redis) instance.
 # Import at https://dashboard.render.com/blueprints (connect the GitHub repo).
+#
+# Free-tier drone-photogrammetry topology: the web service also runs an
+# embedded RQ worker process (WORKER_EMBEDDED=1) because free plans have no
+# background-worker service type; uploads use the backend's local storage
+# (ephemeral disk — fine for demo surveys, use S3 for production); NodeODM
+# itself must run elsewhere (any machine with CPU/RAM, e.g. exposed through
+# a tunnel) and is configured via the NODEODM_URL dashboard variable.
 services:
+  - type: keyvalue
+    name: keyline-redis
+    plan: free
+    ipAllowList: []  # internal connections only
+
   - type: web
     name: keyline-backend
     runtime: docker
@@ -10,3 +22,20 @@ services:
     envVars:
       - key: AWS_NO_SIGN_REQUEST
         value: "YES"
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: keyline-redis
+          property: connectionString
+      - key: WORKER_EMBEDDED
+        value: "1"
+      - key: STORAGE_BACKEND
+        value: local
+      - key: PHOTOGRAMMETRY_PROVIDER
+        value: nodeodm
+      - key: NODEODM_URL
+        sync: false # set in the dashboard (points at your processing node)
+      - key: NODEODM_TOKEN
+        sync: false
+      - key: DRONE_MIN_IMAGES
+        sync: false # dashboard-tunable; backend default is 20

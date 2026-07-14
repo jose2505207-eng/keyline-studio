@@ -403,7 +403,11 @@ export function putWithProgress(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open("PUT", upload.url);
+    // S3 presigned URLs are absolute; the local storage backend returns
+    // API-relative URLs which must resolve against the API base, not the
+    // (possibly separate) frontend origin.
+    const target = upload.url.startsWith("http") ? upload.url : url(upload.url);
+    xhr.open("PUT", target);
     for (const [k, v] of Object.entries(upload.headers)) {
       xhr.setRequestHeader(k, v);
     }

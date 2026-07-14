@@ -14,8 +14,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "import whitebox; whitebox.WhiteboxTools()" || true
 
 COPY app ./app
-RUN mkdir -p data
+COPY start.sh ./start.sh
+RUN chmod +x start.sh && mkdir -p data
 ENV AWS_NO_SIGN_REQUEST=YES
 EXPOSE 8000
-# Shell form so $PORT from the platform (Render, Railway, Fly) is honored.
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+# start.sh honors $PORT and can spawn an embedded RQ worker process
+# (WORKER_EMBEDDED=1) for single-container hosts; compose overrides the
+# command for the dedicated worker service.
+CMD ["./start.sh"]
