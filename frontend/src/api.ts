@@ -422,3 +422,90 @@ export function putWithProgress(
     xhr.send(file);
   });
 }
+
+// ---- analysis runs / reanalysis ----------------------------------------------
+
+export interface ResultCounts {
+  valleys: number;
+  ridges: number;
+  keypoints: number;
+  keylines: number;
+}
+
+export interface QAIssue {
+  code: string;
+  severity: string;
+  message: string;
+}
+
+export interface QAReport {
+  metrics: Record<string, unknown>;
+  issues: QAIssue[];
+  mode: string;
+  passed: boolean;
+  severe: boolean;
+}
+
+export interface ResultsProperties {
+  warning?: string | null;
+  relief_m?: number;
+  keylines_suppressed?: boolean;
+  dem_mode?: string;
+  drone_coverage?: number | null;
+  dem_resolution_m?: number;
+  project_id?: string;
+  survey_id?: string | null;
+  analysis_run_id?: string | null;
+  analysis_crs?: string;
+  dem_bounds_wgs84?: number[];
+  counts?: ResultCounts;
+  notices?: string[];
+  qa?: QAReport | null;
+  qa_mode?: string;
+  watermark?: string | null;
+}
+
+export interface AnalysisRun {
+  id: string;
+  project_id: string;
+  survey_id: string | null;
+  state: string;
+  stage: string | null;
+  dem_mode: string | null;
+  dem_path: string | null;
+  params: Record<string, unknown>;
+  counts: ResultCounts | null;
+  notices: string[];
+  qa: QAReport | null;
+  error_message: string | null;
+  created_at: number;
+  completed_at: number | null;
+}
+
+export async function reanalyze(
+  projectId: string,
+  surveyId: string | null = null
+): Promise<{ run_id: string; state: string }> {
+  const res = await fetch(url(`/api/projects/${projectId}/reanalyze`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ survey_id: surveyId }),
+  });
+  return jsonOrThrow(res);
+}
+
+export async function getAnalysisRuns(projectId: string): Promise<AnalysisRun[]> {
+  const body = await jsonOrThrow(
+    await fetch(url(`/api/projects/${projectId}/analysis-runs`))
+  );
+  return body.runs;
+}
+
+export async function getAnalysisRun(
+  projectId: string,
+  runId: string
+): Promise<AnalysisRun> {
+  return jsonOrThrow(
+    await fetch(url(`/api/projects/${projectId}/analysis-runs/${runId}`))
+  );
+}

@@ -173,8 +173,9 @@ def results_to_kml(fc: dict, aoi: dict | None, doc_name: str = "Keyline Studio")
         if items:
             folder_xml.append(f"<Folder><name>{fname}</name>{''.join(items)}</Folder>")
 
-    warning = (fc.get("properties") or {}).get("warning")
-    desc = escape(warning) if warning else ""
+    props = fc.get("properties") or {}
+    desc_parts = [p for p in (props.get("watermark"), props.get("warning")) if p]
+    desc = escape(" | ".join(desc_parts)) if desc_parts else ""
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>'

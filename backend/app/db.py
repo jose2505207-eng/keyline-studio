@@ -181,3 +181,72 @@ def surveys_in_states(states: list[str]) -> list[dict]:
             f"SELECT * FROM drone_surveys WHERE state IN ({q})", states
         ).fetchall()
     return [_survey_row_to_dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Analysis runs (terrain analysis is versioned; photogrammetry is not rerun)
+
+_RUN_JSON_FIELDS = {"params_json", "qa_json", "counts_json", "notices_json"}
+
+
+def _run_row_to_dict(row) -> dict:
+    d = dict(row)
+    for f in _RUN_JSON_FIELDS:
+        if d.get(f) is not None:
+            try:
+                d[f] = json.loads(d[f])
+            except (TypeError, json.JSONDecodeError):
+                pass
+    return d
+
+
+def create_analysis_run(project_id: str, survey_id: str | None,
+                        dem_path: str | None, params: dict) -> str:
+    rid = uuid.uuid4().hex[:12]
+    now = time.time()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO analysis_runs (id, project_id, survey_id, dem_path, "
+            "params_json, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (rid, project_id, survey_id, dem_path, json.dumps(params), now, now),
+        )
+    return rid
+
+
+def get_analysis_run(rid: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM analysis_runs WHERE id=?", (rid,)).fetchone()
+    return _run_row_to_dict(row) if row else None
+
+
+def list_analysis_runs(project_id: str) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM analysis_runs WHERE project_id=? "
+            "ORDER BY created_at DESC", (project_id,)).fetchall()
+    return [_run_row_to_dict(r) for r in rows]
+
+
+def latest_completed_run(project_id: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM analysis_runs WHERE project_id=? AND "
+            "state='completed' ORDER BY completed_at DESC LIMIT 1",
+            (project_id,)).fetchone()
+    return _run_row_to_dict(row) if row else None
+
+
+def update_analysis_run(rid: str, **fields) -> None:
+    if not fields:
+        return
+    cols, vals = [], []
+    for k, v in fields.items():
+        if k in _RUN_JSON_FIELDS and isinstance(v, (dict, list)):
+            v = json.dumps(v)
+        cols.append(f"{k}=?")
+        vals.append(v)
+    cols.append("updated_at=?")
+    vals.append(time.time())
+    vals.append(rid)
+    with _conn() as c:
+        c.execute(f"UPDATE analysis_runs SET {', '.join(cols)} WHERE id=?", vals)

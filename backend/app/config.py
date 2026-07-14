@@ -174,3 +174,24 @@ def drone_only_min_aoi_coverage() -> float:
 
 def redis_url() -> str:
     return os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+
+
+# --- terrain QA ------------------------------------------------------------------
+
+def terrain_qa_mode() -> str:
+    """warn: run diagnostics and watermark; strict: block keyline generation
+    on severe spatial/terrain quality errors."""
+    v = os.environ.get("TERRAIN_QA_MODE", "warn").strip().lower()
+    return v if v in ("warn", "strict") else "warn"
+
+
+def qa_tilt_threshold_pct() -> float:
+    return _float("QA_TILT_THRESHOLD_PCT", 25.0)
+
+
+def qa_relief_footprint_ratio() -> float:
+    return _float("QA_RELIEF_FOOTPRINT_RATIO", 0.6)
+
+
+def result_bounds_buffer_m() -> float:
+    return _float("RESULT_BOUNDS_BUFFER_M", 50.0)

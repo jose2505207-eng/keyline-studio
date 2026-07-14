@@ -88,6 +88,10 @@ export default function App() {
   const [orthoInfo, setOrthoInfo] = useState<api.OrthophotoInfo | null>(null);
   const [orthoVisible, setOrthoVisible] = useState(true);
   const [orthoOpacity, setOrthoOpacity] = useState(0.9);
+  const [resultsProps, setResultsProps] = useState<api.ResultsProperties | null>(null);
+  const [runs, setRuns] = useState<api.AnalysisRun[]>([]);
+  const [rerunning, setRerunning] = useState(false);
+  const rerunTimer = useRef<number | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
   const [mapMeta, setMapMeta] = useState<api.MapMeta | null>(null);
   const [scanOverlay, setScanOverlay] = useState<{
@@ -614,8 +618,10 @@ export default function App() {
     if (!map) return;
     const [fc, hs] = await Promise.all([api.getResults(pid), api.getHillshade(pid)]);
     resultsRef.current = fc;
-    const fcProps = (fc as { properties?: { warning?: string | null } }).properties;
+    const fcProps = (fc as { properties?: api.ResultsProperties }).properties ?? null;
+    setResultsProps(fcProps);
     setWarning(fcProps?.warning ?? null);
+    api.getAnalysisRuns(pid).then(setRuns).catch(() => setRuns([]));
 
     map.addSource("hillshade", {
       type: "image",
@@ -793,18 +799,69 @@ export default function App() {
   };
 
   // ----------------------------------------------------------------- export
-  const exportGeoJSON = () => {
-    const fc = resultsRef.current;
-    if (!fc) return;
-    const blob = new Blob([JSON.stringify(fc, null, 2)], {
-      type: "application/geo+json",
-    });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "keyline-results.geojson";
-    a.click();
-    URL.revokeObjectURL(a.href);
+  const exportGeoJSON = async () => {
+    if (!projectId) return;
+    // Always export the server's current, spatially-validated result for
+    // *this* project — never a stale in-browser copy.
+    try {
+      const fc = await api.getResults(projectId);
+      const blob = new Blob([JSON.stringify(fc, null, 2)], {
+        type: "application/geo+json",
+      });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `keyline-${projectId}-diagnostic-layers.geojson`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (err) {
+      setJobState(`error:${(err as Error).message}`);
+    }
   };
+
+  // ------------------------------------------------------------- reanalysis
+  const stopRerunPolling = () => {
+    if (rerunTimer.current !== null) {
+      window.clearTimeout(rerunTimer.current);
+      rerunTimer.current = null;
+    }
+  };
+
+  const rerunAnalysis = async () => {
+    if (!projectId) return;
+    setRerunning(true);
+    setJobState("");
+    try {
+      const { run_id } = await api.reanalyze(projectId, null);
+      const poll = async () => {
+        try {
+          const run = await api.getAnalysisRun(projectId, run_id);
+          setJobState(run.state === "completed" ? "done"
+            : run.state === "failed" ? `error:${run.error_message}`
+              : `running:${run.stage ?? run.state}`);
+          if (run.state === "completed") {
+            setRerunning(false);
+            clearResults();
+            try { await loadOrthophoto(projectId); } catch { /* optional */ }
+            await loadResults(projectId);
+            setJobState("done");
+            return;
+          }
+          if (run.state === "failed") {
+            setRerunning(false);
+            return;
+          }
+        } catch {
+          /* transient */
+        }
+        rerunTimer.current = window.setTimeout(() => void poll(), 2500);
+      };
+      void poll();
+    } catch (err) {
+      setRerunning(false);
+      setJobState(`error:${(err as Error).message}`);
+    }
+  };
+  useEffect(() => stopRerunPolling, []);
 
   // ------------------------------------------------------------------ layers
   const toggleLayer = (id: LayerKey) => {
@@ -831,6 +888,18 @@ export default function App() {
           <button onClick={() => setWarning(null)} title="Dismiss">
             ✕
           </button>
+        </div>
+      )}
+
+      {!warning && resultsProps?.watermark && (
+        <div className="warning-banner amber">
+          <span>
+            ⚠ {resultsProps.watermark}
+            {resultsProps.qa?.issues
+              ?.filter((i) => i.severity === "error")
+              .map((i) => ` [${i.code}]`)
+              .join("")}
+          </span>
         </div>
       )}
 
@@ -1021,6 +1090,12 @@ export default function App() {
             ▶ Analyze
           </button>
         )}
+        {hasResults && projectId && (
+          <button disabled={rerunning || busy} onClick={rerunAnalysis}>
+            ↻ Re-run terrain analysis {rerunning ? "…" : ""}
+          </button>
+        )}
+
         <div className="export-wrap">
           <button
             disabled={!hasResults}
@@ -1032,23 +1107,70 @@ export default function App() {
             <div className="export-menu">
               <button
                 onClick={() => {
-                  exportGeoJSON();
+                  void exportGeoJSON();
                   setExportOpen(false);
                 }}
               >
-                GeoJSON
+                GeoJSON (diagnostic layers)
               </button>
               <button
+                disabled={(resultsProps?.counts?.keylines ?? 0) === 0}
+                title={(resultsProps?.counts?.keylines ?? 0) === 0
+                  ? "No valid keyline exists in this result"
+                  : "Styled KML for Google Earth"}
                 onClick={() => {
                   if (projectId) window.open(api.exportKmlUrl(projectId), "_blank");
                   setExportOpen(false);
                 }}
               >
-                KML (Google Earth)
+                KML keyline design
               </button>
             </div>
           )}
         </div>
+
+        {hasResults && resultsProps?.counts && (
+          <div className="counts">
+            <b>Valleys {resultsProps.counts.valleys}</b> ·{" "}
+            <b>Ridges {resultsProps.counts.ridges}</b> ·{" "}
+            <b>Keypoints {resultsProps.counts.keypoints}</b> ·{" "}
+            <b>Keylines {resultsProps.counts.keylines}</b>
+            {resultsProps.notices?.includes("NO_VALID_KEYPOINT") && (
+              <div className="muted">
+                No valid keypoint found in this AOI — no candidate keyline was
+                generated.
+              </div>
+            )}
+            {resultsProps.notices?.includes("KEYLINE_GENERATION_BLOCKED") && (
+              <div className="muted">
+                Keyline generation blocked: severe terrain-quality issues
+                (strict mode).
+              </div>
+            )}
+            <div className="muted">
+              {resultsProps.dem_mode}
+              {resultsProps.dem_resolution_m != null &&
+                ` · ${resultsProps.dem_resolution_m} m/px`}
+              {resultsProps.qa && (
+                <> · QA {resultsProps.qa.severe ? "✗ failed"
+                  : resultsProps.qa.passed ? "✓ passed" : "⚠ warnings"}</>
+              )}
+              {resultsProps.analysis_run_id &&
+                ` · run ${resultsProps.analysis_run_id}`}
+            </div>
+            {runs.length > 1 && (
+              <div className="muted">
+                Previous runs:{" "}
+                {runs.slice(0, 4).map((r) => (
+                  <span key={r.id}>
+                    {r.id.slice(0, 6)} ({r.state}
+                    {r.counts ? `, ${r.counts.keylines} keylines` : ""}){" "}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {(running || error || jobState === "done") && (
           <div className="status">

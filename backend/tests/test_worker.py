@@ -54,13 +54,21 @@ def test_full_survey_lifecycle_completes_with_terrain(drone_env, monkeypatch):
                             "provider-output.log")
     assert os.path.isfile(log_path)
 
-    # terrain results generated from the DTM in drone-only mode
-    results = json.load(open(drone_env.data_dir / pid / "results.geojson"))
+    # terrain results generated from the DTM in drone-only mode, stored in a
+    # versioned analysis-run directory and served through the API
+    r = drone_env.client.get(f"/api/projects/{pid}/results")
+    assert r.status_code == 200
+    results = r.json()
     props = results["properties"]
     assert props["dem_mode"] == "drone_only"
     assert props["drone_coverage"] >= 0.98
     assert props["warning"] is None
     assert not props["keylines_suppressed"]
+    assert props["project_id"] == pid
+    assert props["analysis_run_id"]
+    assert "counts" in props
+    runs = drone_env.client.get(f"/api/projects/{pid}/analysis-runs").json()["runs"]
+    assert len(runs) == 1 and runs[0]["state"] == "completed"
 
 
 def test_provider_failure_preserves_error_and_logs(drone_env, monkeypatch):

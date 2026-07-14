@@ -136,17 +136,29 @@ async def upload_drone_dem(pid: str, file: UploadFile):
     return {"ok": True, **info}
 
 
+def _results_dir(pid: str) -> str:
+    """Directory holding the project's current analysis outputs: the latest
+    completed analysis run, falling back to the legacy project-level layout
+    for pre-versioning projects."""
+    run = db.latest_completed_run(pid)
+    if run and run.get("result_dir") and \
+            os.path.isfile(os.path.join(run["result_dir"], "results.geojson")):
+        return run["result_dir"]
+    return project_dir(pid)
+
+
 def _run_job(jid: str, pid: str):
     proj = db.get_project(pid)
+    from .jobs.terrain_job import execute_analysis_run
+
     try:
         def progress(step: str):
             db.update_job(jid, f"running:{step}", log_line=step)
 
         db.update_job(jid, "running:starting", log_line="starting")
-        pipeline.run_pipeline(
-            project_dir(pid), proj["aoi"],
-            drone_path=proj.get("drone_path"), progress=progress,
-        )
+        rid = db.create_analysis_run(pid, None, proj.get("drone_path"),
+                                     {"trigger": "analyze", "dem_mode": "auto"})
+        execute_analysis_run(rid, extra_progress=progress)
         db.update_job(jid, "done", log_line="done")
     except (DemSourceError, ValueError) as exc:
         db.update_job(jid, f"error:{exc}", log_line=str(exc))
@@ -174,7 +186,7 @@ def status(pid: str):
 @app.get("/api/projects/{pid}/results")
 def results(pid: str):
     _require_project(pid)
-    path = os.path.join(project_dir(pid), "results.geojson")
+    path = os.path.join(_results_dir(pid), "results.geojson")
     if not os.path.exists(path):
         raise HTTPException(404, "No results yet — run analyze first")
     with open(path) as f:
@@ -184,8 +196,8 @@ def results(pid: str):
 @app.get("/api/projects/{pid}/hillshade")
 def hillshade(pid: str):
     _require_project(pid)
-    path = os.path.join(project_dir(pid), "hillshade.png")
-    bounds_path = os.path.join(project_dir(pid), "hillshade_bounds.json")
+    path = os.path.join(_results_dir(pid), "hillshade.png")
+    bounds_path = os.path.join(_results_dir(pid), "hillshade_bounds.json")
     if not os.path.exists(path):
         raise HTTPException(404, "No hillshade yet")
     with open(bounds_path) as f:
@@ -197,7 +209,7 @@ def hillshade(pid: str):
 @app.get("/api/projects/{pid}/hillshade-bounds")
 def hillshade_bounds(pid: str):
     _require_project(pid)
-    bounds_path = os.path.join(project_dir(pid), "hillshade_bounds.json")
+    bounds_path = os.path.join(_results_dir(pid), "hillshade_bounds.json")
     if not os.path.exists(bounds_path):
         raise HTTPException(404, "No hillshade yet")
     with open(bounds_path) as f:
@@ -209,11 +221,97 @@ def move_keypoint(pid: str, kid: str, body: MoveIn):
     proj = _require_project(pid)
     try:
         return pipeline.recompute_keyline(
-            project_dir(pid), proj["aoi"], kid, body.lng, body.lat)
+            _results_dir(pid), proj["aoi"], kid, body.lng, body.lat)
     except KeyError:
         raise HTTPException(404, f"Keypoint {kid} not found")
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(422, str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Versioned terrain re-analysis (never resubmits photogrammetry)
+
+
+class ReanalyzeIn(BaseModel):
+    survey_id: str | None = None   # pick a specific survey's DTM
+    dem_mode: str = "auto"
+
+
+@app.post("/api/projects/{pid}/reanalyze")
+def reanalyze(pid: str, body: ReanalyzeIn):
+    """Re-run terrain analysis with the existing validated drone DTM and the
+    current AOI. Photographs are never resubmitted to the processing node;
+    a new analysis run is created and previous runs are preserved."""
+    proj = _require_project(pid)
+
+    dem_path = None
+    survey_id = body.survey_id
+    if survey_id:
+        survey = db.get_survey(survey_id)
+        if survey is None or survey["project_id"] != pid:
+            raise HTTPException(404, "Survey not found in this project")
+        dem_path = survey.get("dtm_path")
+        if not dem_path or not os.path.isfile(dem_path):
+            raise HTTPException(422, "That survey has no validated DTM")
+    else:
+        # latest survey DTM, then the manually uploaded one
+        for s in db.list_surveys(pid):
+            if s.get("dtm_path") and os.path.isfile(s["dtm_path"]):
+                dem_path, survey_id = s["dtm_path"], s["id"]
+                break
+        if dem_path is None and proj.get("drone_path") and \
+                os.path.isfile(proj["drone_path"]):
+            dem_path = proj["drone_path"]
+
+    if body.dem_mode in ("drone_only", "fused") and not dem_path:
+        raise HTTPException(422, f"dem_mode={body.dem_mode} requires a drone "
+                                 "DTM, and this project has none")
+
+    rid = db.create_analysis_run(pid, survey_id, dem_path,
+                                 {"trigger": "reanalyze",
+                                  "dem_mode": body.dem_mode})
+    from .jobs import QueueUnavailable, get_queue
+
+    try:
+        get_queue().enqueue("app.jobs.terrain_job.run_analysis_job", rid,
+                            job_timeout=3600, result_ttl=86400)
+    except QueueUnavailable as exc:
+        db.update_analysis_run(rid, state="failed",
+                               error_message=f"worker queue unavailable: {exc}")
+        raise HTTPException(503, str(exc))
+    return {"run_id": rid, "state": "queued",
+            "dem_path": bool(dem_path), "survey_id": survey_id}
+
+
+def _run_out(run: dict) -> dict:
+    return {
+        "id": run["id"], "project_id": run["project_id"],
+        "survey_id": run.get("survey_id"), "state": run["state"],
+        "stage": run.get("stage"), "dem_mode": run.get("dem_mode"),
+        "dem_path": os.path.basename(run["dem_path"]) if run.get("dem_path") else None,
+        "params": run.get("params_json") or {},
+        "counts": run.get("counts_json"),
+        "notices": run.get("notices_json") or [],
+        "qa": run.get("qa_json"),
+        "error_message": run.get("error_message"),
+        "created_at": run["created_at"],
+        "completed_at": run.get("completed_at"),
+    }
+
+
+@app.get("/api/projects/{pid}/analysis-runs")
+def list_analysis_runs(pid: str):
+    _require_project(pid)
+    return {"runs": [_run_out(r) for r in db.list_analysis_runs(pid)]}
+
+
+@app.get("/api/projects/{pid}/analysis-runs/{rid}")
+def get_analysis_run(pid: str, rid: str):
+    _require_project(pid)
+    run = db.get_analysis_run(rid)
+    if run is None or run["project_id"] != pid:
+        raise HTTPException(404, "Analysis run not found in this project")
+    return _run_out(run)
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +337,7 @@ def export_kml(pid: str):
     from .kml_io import results_to_kml
 
     proj = _require_project(pid)
-    path = os.path.join(project_dir(pid), "results.geojson")
+    path = os.path.join(_results_dir(pid), "results.geojson")
     if not os.path.exists(path):
         raise HTTPException(404, "No results yet — run analyze first")
     with open(path) as f:

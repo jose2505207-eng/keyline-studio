@@ -45,6 +45,31 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON drone_surveys(project_id);
         """,
     ),
+    (
+        2,
+        """
+        CREATE TABLE IF NOT EXISTS analysis_runs (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            survey_id TEXT,
+            state TEXT NOT NULL DEFAULT 'queued',
+            stage TEXT,
+            dem_mode TEXT,
+            dem_path TEXT,
+            params_json TEXT NOT NULL DEFAULT '{}',
+            qa_json TEXT,
+            counts_json TEXT,
+            notices_json TEXT NOT NULL DEFAULT '[]',
+            error_message TEXT,
+            result_dir TEXT,
+            created_at REAL NOT NULL,
+            completed_at REAL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_analysis_runs_project
+            ON analysis_runs(project_id);
+        """,
+    ),
 ]
 
 

@@ -650,3 +650,14 @@ body,
   width: 100%;
   margin: 0 0 4px;
 }
+
+.warning-banner.amber {
+  background: #9a6a00;
+}
+
+.counts {
+  font-size: 12px;
+  line-height: 1.5;
+  border-top: 1px solid #ddd;
+  padding-top: 6px;
+}

@@ -112,11 +112,14 @@ def run_terrain_analysis(
     )
 
     progress("extracting ridges")
-    _, facc_inv = engine.flow_accumulation(
+    conditioned_inv, facc_inv = engine.flow_accumulation(
         np.where(np.isnan(dem), np.nan, -dem), transform
     )
+    # orient ridge lines by real elevation (negate the inverted-conditioned
+    # surface) — previously the valley-conditioned surface leaked in here
+    ridge_orient = np.where(np.isnan(conditioned_inv), np.nan, -conditioned_inv)
     res.ridges = terrain.extract_stream_lines(
-        facc_inv, conditioned, transform,
+        facc_inv, ridge_orient, transform,
         threshold_cells=threshold_cells,
         min_length_m=params.min_line_length_m,
     )
@@ -176,40 +179,69 @@ def _utm_grid_for_aoi(aoi_wgs84) -> tuple[str, object]:
     return utm.to_string(), gdf.to_crs(utm).geometry.iloc[0]
 
 
-def _write_outputs(project_dir: str, dem_da: xr.DataArray, result: TerrainResult,
-                   aoi_utm, utm_crs: str, drone_weight: np.ndarray | None,
-                   extra_properties: dict | None = None):
-    """Clip vectors to AOI, reproject to WGS84, write GeoJSON + hillshade."""
+def _write_outputs(out_dir: str, dem_da: xr.DataArray, result: TerrainResult,
+                   ctx, drone_weight: np.ndarray | None,
+                   extra_properties: dict | None = None,
+                   notices: list[str] | None = None):
+    """Clip vectors to the AOI, validate them, reproject to WGS84 exactly
+    once, gate them against the run's spatial context, and write atomically.
+
+    All spatial facts come from the immutable AnalysisSpatialContext — never
+    from module state or a previous job."""
+    import io
+
     from PIL import Image
 
-    to_wgs = Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True).transform
+    from . import config as _config
+    from . import spatial
+
+    notices = list(notices or [])
+    strict = _config.terrain_qa_mode() == "strict"
+    to_wgs = ctx.to_wgs84()
+    aoi_analysis = ctx.aoi_analysis
     dem = dem_da.values
     transform = dem_da.rio.transform()
     cell = abs(transform.a)
     inv = ~transform
 
-    def clip_and_project(geom):
-        clipped = geom.intersection(aoi_utm)
+    def clip_lines(geom):
+        """Clip to the AOI in the analysis CRS; stays in analysis CRS."""
+        clipped = geom.intersection(aoi_analysis)
         if clipped.is_empty:
             return []
         parts = getattr(clipped, "geoms", [clipped])
-        return [shp_transform(to_wgs, g) for g in parts if g.geom_type == "LineString"
-                and g.length > 2 * cell]
+        return [g for g in parts if g.geom_type == "LineString"
+                and g.length > 2 * cell and spatial.distinct_points(g) >= 2]
 
+    # ---- build vectors in the ANALYSIS CRS ---------------------------------
+    valley_lines = [g for v in result.valleys for g in clip_lines(v)]
+    ridge_lines = [g for r in result.ridges for g in clip_lines(r)]
+
+    # ridge == valley geometry is a contradiction, not a landform
+    dupe_notices = spatial.check_terrain_sets(valley_lines, ridge_lines,
+                                              strict=strict)
+    if dupe_notices:
+        valley_keys = {spatial._coord_key(v) for v in valley_lines}
+        ridge_lines = [r for r in ridge_lines
+                       if spatial._coord_key(r) not in valley_keys]
+        notices.extend(dupe_notices)
+
+    # ---- serialize: one transform to WGS84, at the very end ----------------
     features = []
-    for i, v in enumerate(result.valleys):
-        for g in clip_and_project(v):
-            features.append({"type": "Feature", "geometry": mapping(g),
-                             "properties": {"kind": "valley", "id": f"v{i}"}})
-    for i, r in enumerate(result.ridges):
-        for g in clip_and_project(r):
-            features.append({"type": "Feature", "geometry": mapping(g),
-                             "properties": {"kind": "ridge", "id": f"r{i}"}})
+    for i, g in enumerate(valley_lines):
+        features.append({"type": "Feature",
+                         "geometry": mapping(shp_transform(to_wgs, g)),
+                         "properties": {"kind": "valley", "id": f"v{i}"}})
+    for i, g in enumerate(ridge_lines):
+        features.append({"type": "Feature",
+                         "geometry": mapping(shp_transform(to_wgs, g)),
+                         "properties": {"kind": "ridge", "id": f"r{i}"}})
 
     kp_ids = []
+    kp_count = 0
     for i, kp in enumerate(result.keypoints):
         p: Point = kp["point"]
-        if not aoi_utm.contains(p):
+        if not aoi_analysis.contains(p):
             kp_ids.append(None)
             continue
         source = "satellite"
@@ -221,45 +253,74 @@ def _write_outputs(project_dir: str, dem_da: xr.DataArray, result: TerrainResult
                 source = "drone"
         kid = f"k{i}"
         kp_ids.append(kid)
-        wp = shp_transform(to_wgs, p)
+        kp_count += 1
         features.append({
-            "type": "Feature", "geometry": mapping(wp),
+            "type": "Feature",
+            "geometry": mapping(shp_transform(to_wgs, p)),
             "properties": {"kind": "keypoint", "id": kid,
                            "elevation": round(kp["elevation"], 2),
                            "confidence": round(kp["confidence"], 3),
                            "source": source},
         })
 
+    keyline_count = 0
     for kl in result.keylines:
         kid = kp_ids[kl["keypoint_idx"]]
         if kid is None:
             continue
-        for g in clip_and_project(kl["line"]):
-            features.append({"type": "Feature", "geometry": mapping(g),
-                             "properties": {"kind": "keyline", "keypoint_id": kid,
+        for g in clip_lines(kl["line"]):
+            keyline_count += 1
+            features.append({"type": "Feature",
+                             "geometry": mapping(shp_transform(to_wgs, g)),
+                             "properties": {"kind": "keyline",
+                                            "keypoint_id": kid,
                                             "id": f"l{kl['keypoint_idx']}"}})
 
+    counts = {"valleys": len(valley_lines), "ridges": len(ridge_lines),
+              "keypoints": kp_count, "keylines": keyline_count}
+    if kp_count == 0:
+        # honest semantics: not a software failure, but no keyline design
+        notices.append("NO_VALID_KEYPOINT")
+
     fc = {"type": "FeatureCollection", "features": features}
-    if extra_properties:
-        # Foreign member (RFC 7946 §6.1) carrying data-quality info for the UI.
-        fc["properties"] = extra_properties
-    with open(os.path.join(project_dir, "results.geojson"), "w") as f:
-        json.dump(fc, f)
+    props = dict(extra_properties or {})
+    props.update({
+        "project_id": ctx.project_id,
+        "survey_id": ctx.survey_id,
+        "analysis_run_id": ctx.analysis_run_id,
+        "analysis_crs": ctx.analysis_crs,
+        "dem_bounds_wgs84": [round(v, 6) for v in ctx.dem_bounds_wgs84],
+        "counts": counts,
+        "notices": notices,
+    })
+    fc["properties"] = props  # foreign member (RFC 7946 §6.1)
+
+    # ---- spatial-integrity gate: never export impossible geography ---------
+    spatial.validate_fc_bounds(fc, ctx,
+                               buffer_m=_config.result_bounds_buffer_m())
+
+    os.makedirs(out_dir, exist_ok=True)
+    spatial.atomic_write_json(os.path.join(out_dir, "results.geojson"), fc)
 
     # Hillshade PNG + bounds sidecar (WGS84 corner coords for MapLibre overlay)
     hs = terrain.hillshade(dem, cell)
     alpha = np.where(np.isnan(dem), 0, 255).astype(np.uint8)
+    buf = io.BytesIO()
     Image.merge("LA", (Image.fromarray(hs), Image.fromarray(alpha))).save(
-        os.path.join(project_dir, "hillshade.png"))
+        buf, format="PNG")
+    spatial.atomic_write_bytes(os.path.join(out_dir, "hillshade.png"),
+                               buf.getvalue())
     left, bottom, right, top = dem_da.rio.bounds()
     corners = [to_wgs(x, y) for x, y in
                [(left, top), (right, top), (right, bottom), (left, bottom)]]
-    with open(os.path.join(project_dir, "hillshade_bounds.json"), "w") as f:
-        json.dump({"coordinates": [list(c) for c in corners]}, f)
+    spatial.atomic_write_json(os.path.join(out_dir, "hillshade_bounds.json"),
+                              {"coordinates": [list(c) for c in corners]})
     # World file so the PNG is also usable in GIS tools
-    with open(os.path.join(project_dir, "hillshade.pgw"), "w") as f:
-        f.write(f"{transform.a}\n{transform.b}\n{transform.d}\n{transform.e}\n"
-                f"{transform.c + transform.a / 2}\n{transform.f + transform.e / 2}\n")
+    spatial.atomic_write_bytes(
+        os.path.join(out_dir, "hillshade.pgw"),
+        (f"{transform.a}\n{transform.b}\n{transform.d}\n{transform.e}\n"
+         f"{transform.c + transform.a / 2}\n"
+         f"{transform.f + transform.e / 2}\n").encode())
 
     return fc
 
@@ -325,8 +386,19 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
                  drone_path: str | None = None,
                  progress: Callable[[str], None] = lambda s: None,
                  params: Params = Params(),
-                 dem_mode: str = "auto") -> dict:
-    """Full pipeline for a project. Returns the result FeatureCollection."""
+                 dem_mode: str = "auto",
+                 out_dir: str | None = None,
+                 survey_id: str | None = None,
+                 analysis_run_id: str | None = None,
+                 gcp_supplied: bool = False,
+                 satellite_qa: bool = False) -> dict:
+    """Full pipeline for a project. Returns the result FeatureCollection.
+
+    ``out_dir`` (defaults to ``project_dir`` for backward compatibility)
+    receives the run's outputs; callers doing versioned analysis runs pass a
+    per-run directory so no two runs can overwrite each other."""
+    out_dir = out_dir or project_dir
+    project_id = os.path.basename(os.path.normpath(project_dir))
     aoi = shape(aoi_geojson)
 
     # --- guards
@@ -420,6 +492,54 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
             raise ValueError("The AOI contains no elevation data.")
         dem_da = dem_da.copy(data=dem)
 
+    # --- immutable spatial context: the single source of geographic truth
+    # for everything downstream (built once, after the DEM is selected)
+    from . import spatial as spatial_mod
+
+    dem_crs = None
+    if dem_mode != "satellite_only" and drone_path:
+        import rasterio as _rio
+
+        with _rio.open(drone_path) as _src:
+            dem_crs = str(_src.crs)
+    ctx = spatial_mod.build_spatial_context(
+        project_id=project_id,
+        survey_id=survey_id,
+        analysis_run_id=analysis_run_id,
+        dem_path=drone_path if dem_mode != "satellite_only" else None,
+        dem_crs=dem_crs,
+        analysis_crs=utm_crs,
+        aoi_wgs84_geojson=aoi_geojson,
+        dem_bounds_analysis=tuple(dem_da.rio.bounds()),
+    )
+
+    # --- DTM quality assurance (drone-derived surfaces only) -----------------
+    from . import config as _config
+    from . import terrain_quality
+
+    notices: list[str] = []
+    qa_dict = None
+    watermark = None
+    qa_blocks_keylines = False
+    if dem_mode in ("drone_only", "fused") and drone_path:
+        progress("running DTM quality assurance")
+        sat_fn = (terrain_quality.satellite_surface_for(drone_path)
+                  if satellite_qa else None)
+        qa = terrain_quality.assess_dtm(
+            drone_path, aoi_coverage=drone_coverage,
+            gcp_supplied=gcp_supplied, satellite_surface=sat_fn)
+        qa_dict = qa.to_dict()
+        if qa.severe:
+            if qa.mode == "strict":
+                qa_blocks_keylines = True
+                notices.append("KEYLINE_GENERATION_BLOCKED")
+                progress("severe terrain-quality issues — keyline generation "
+                         "blocked (strict mode)")
+            else:
+                watermark = terrain_quality.WATERMARK
+                progress("severe terrain-quality issues — result will be "
+                         "watermarked as diagnostic")
+
     # --- terrain analysis (steps 4-9); suppressed entirely when the terrain
     # signal is below the satellite noise floor (hillshade still produced)
     if quality["suppress"]:
@@ -428,18 +548,21 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
     else:
         result = run_terrain_analysis(dem, dem_da.rio.transform(), params,
                                       progress, drone_weight=drone_weight)
+    if qa_blocks_keylines:
+        result.keypoints = []
+        result.keylines = []
 
     # --- persist DEM for keypoint-move recomputation, then outputs
     progress("writing outputs")
-    os.makedirs(project_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
     dem_da.rio.write_nodata(np.nan, inplace=True)
-    dem_da.rio.to_raster(os.path.join(project_dir, "dem_utm.tif"))
+    dem_da.rio.to_raster(os.path.join(out_dir, "dem_utm.tif"))
     if drone_weight is not None:
-        np.save(os.path.join(project_dir, "drone_weight.npy"), drone_weight)
-    with open(os.path.join(project_dir, "meta.json"), "w") as f:
-        json.dump({"utm_crs": utm_crs}, f)
+        np.save(os.path.join(out_dir, "drone_weight.npy"), drone_weight)
+    spatial_mod.atomic_write_json(os.path.join(out_dir, "meta.json"),
+                                  {"utm_crs": utm_crs})
 
-    fc = _write_outputs(project_dir, dem_da, result, aoi_utm, utm_crs, drone_weight,
+    fc = _write_outputs(out_dir, dem_da, result, ctx, drone_weight,
                         extra_properties={
                             "warning": quality["warning"],
                             "relief_m": quality["relief_m"],
@@ -450,7 +573,11 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
                                                else None),
                             "dem_resolution_m": round(
                                 abs(dem_da.rio.transform().a), 3),
-                        })
+                            "qa": qa_dict,
+                            "qa_mode": _config.terrain_qa_mode(),
+                            "watermark": watermark,
+                        },
+                        notices=notices)
     return fc
 
 
