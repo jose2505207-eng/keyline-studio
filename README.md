@@ -120,6 +120,28 @@ Vercel (static frontend) → Render or any host (API + worker) → external
 Redis + S3 + NodeODM. The API host itself stays small; the NodeODM node
 carries the compute.
 
+### Free-tier hosted topology (as deployed)
+
+The live Vercel app runs the drone workflow with zero paid services:
+
+- **Render web service** also runs the RQ worker as a second process in the
+  same container (`WORKER_EMBEDDED=1` in `start.sh`) since free plans have no
+  background-worker type. The frontend's status polling keeps the instance
+  awake during processing; if it still spins down mid-job, startup
+  reconciliation + Retry resume the existing NodeODM task.
+- **Render Key Value** (free 25 MB Redis) provides the queue, wired in
+  `render.yaml` via `fromService`.
+- **`STORAGE_BACKEND=local`**: photos upload straight to the backend's
+  `/api/local-uploads/…` endpoint onto ephemeral disk — fine for demo
+  surveys; switch to S3 for production datasets (uploads are lost on
+  instance restart, re-upload and retry).
+- **NodeODM through a tunnel**: any machine running
+  `docker run -p 3000:3000 opendronemap/nodeodm` can serve as the processing
+  node, exposed with e.g. `cloudflared tunnel --url http://localhost:3000`.
+  Quick-tunnel URLs are ephemeral — when the tunnel restarts, update
+  `NODEODM_URL` in the Render dashboard. Photogrammetry only works while
+  that node is up; everything else (satellite, manual DTM) is unaffected.
+
 ## Layout
 
 ```
