@@ -72,11 +72,26 @@ while [ $i -lt 20 ]; do
     sleep 15
 done
 
-# heartbeat: re-announce every 5 min while cloudflared lives (idempotent;
-# also restores the override after a backend restart wipes ephemeral disk)
+# heartbeat: re-announce every 5 min while the tunnel WORKS (idempotent;
+# also restores the override after a backend restart wipes ephemeral disk).
+# A live cloudflared process is not enough — quick-tunnel hostnames can die
+# while the process survives (e.g. after machine suspend), so probe the URL
+# itself and exit for a supervisor restart when it stops routing.
+FAILS=0
 while kill -0 "$CFPID" 2>/dev/null; do
     sleep 300
     kill -0 "$CFPID" 2>/dev/null || break
+    PROBE="$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$URL/info" || true)"
+    if [ "$PROBE" != "200" ]; then
+        FAILS=$((FAILS + 1))
+        echo "tunnel probe failed ($PROBE), strike $FAILS/2" >&2
+        if [ $FAILS -ge 2 ]; then
+            echo "tunnel URL dead while process alive — restarting" >&2
+            exit 1
+        fi
+        continue
+    fi
+    FAILS=0
     announce >/dev/null
 done
 
