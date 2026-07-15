@@ -13,6 +13,7 @@ interface PersistedSession {
   projectId: string | null;
   surveyId: string | null;
   aoi: GeoJSON.Polygon | null;
+  dtmId?: string | null;
 }
 
 function loadSession(): PersistedSession {
@@ -22,7 +23,7 @@ function loadSession(): PersistedSession {
   } catch {
     /* corrupted storage — start fresh */
   }
-  return { projectId: null, surveyId: null, aoi: null };
+  return { projectId: null, surveyId: null, aoi: null, dtmId: null };
 }
 
 const COLORS = {
@@ -35,7 +36,7 @@ const COLORS = {
 
 const MAX_AOI_KM2 = 100;
 
-const RESULT_LAYER_IDS = ["hillshade", "valleys", "ridges", "keylines", "keypoints"];
+const RESULT_LAYER_IDS = ["hillshade", "contours", "valleys", "ridges", "keylines", "keypoints"];
 
 type LayerKey = (typeof RESULT_LAYER_IDS)[number];
 type Basemap = "satellite" | "streets";
@@ -84,6 +85,8 @@ export default function App() {
   const [droneInfo, setDroneInfo] = useState<api.DroneInfo | null>(null);
   const [isDsm, setIsDsm] = useState(false);
   const [terrainSource, setTerrainSource] = useState<"drone" | "dtm" | "satellite">("satellite");
+  const [dtmId, setDtmId] = useState<string | null>(null);
+  const [exportsAvail, setExportsAvail] = useState<api.ExportAvailability | null>(null);
   const [surveyId, setSurveyId] = useState<string | null>(null);
   const [orthoInfo, setOrthoInfo] = useState<api.OrthophotoInfo | null>(null);
   const [orthoVisible, setOrthoVisible] = useState(true);
@@ -104,6 +107,7 @@ export default function App() {
   const scanInputRef = useRef<HTMLInputElement>(null);
   const [visible, setVisible] = useState<Record<LayerKey, boolean>>({
     hillshade: true,
+    contours: true,
     valleys: true,
     ridges: true,
     keylines: true,
@@ -248,6 +252,10 @@ export default function App() {
     setProjectId(session.projectId);
     setSurveyId(session.surveyId);
     if (session.surveyId) setTerrainSource("drone");
+    if (session.dtmId) {
+      setDtmId(session.dtmId);
+      setTerrainSource("dtm");
+    }
     aoiRef.current = session.aoi;
     const map = mapRef.current;
     const restore = () => {
@@ -273,9 +281,9 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      projectId, surveyId, aoi: aoiRef.current,
+      projectId, surveyId, aoi: aoiRef.current, dtmId,
     } satisfies PersistedSession));
-  }, [projectId, surveyId]);
+  }, [projectId, surveyId, dtmId]);
 
   const setAoiOnMap = (poly: GeoJSON.Polygon | null) => {
     const src = mapRef.current?.getSource("aoi") as
@@ -507,7 +515,7 @@ export default function App() {
   // ------------------------------------------------------------- drone DEM
 
   // --------------------------------------------------------------- analysis
-  const analyze = async (options: { dtmId?: string; demMode?: string } = {}) => {
+  const analyze = async (options: { dtmId?: string; demMode?: string; terrain?: Record<string, number> } = {}) => {
     if (!projectId) return;
     clearResults();
     setBusy(true);
@@ -542,6 +550,40 @@ export default function App() {
     }
   };
   useEffect(() => stopPolling, []);
+
+  // -------------------------------------------------------- DTM locate flow
+  const locateDtm = useCallback(async (dtm: api.Dtm) => {
+    const map = mapRef.current;
+    if (!map || !dtm.bbox_wgs84) return;
+    // stale layers from a previously selected DTM must never linger
+    clearResults();
+    const [w, s, e, n] = dtm.bbox_wgs84;
+    map.fitBounds([[w, s], [e, n]], {
+      padding: 70,
+      maxZoom: 18, // tiny rasters must not zoom to blur
+      duration: 1200,
+    });
+    // draw the footprint (orange dashed source already styled)
+    if (dtm.footprint_geojson) {
+      const src = map.getSource("drone-fp") as
+        | maplibregl.GeoJSONSource
+        | undefined;
+      src?.setData({
+        type: "FeatureCollection",
+        features: [{ type: "Feature", geometry: dtm.footprint_geojson,
+                     properties: {} }],
+      });
+    }
+    // no AOI yet? adopt the DTM footprint so analysis can start immediately
+    // (the user can redraw a smaller AOI afterwards)
+    if (!projectIdRef.current) {
+      const ring: [number, number][] = [
+        [w, s], [e, s], [e, n], [w, n], [w, s],
+      ];
+      await adoptAoi({ type: "Polygon", coordinates: [ring] });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ------------------------------------------------------------ orthophoto
   const removeOrthoLayer = () => {
@@ -605,6 +647,8 @@ export default function App() {
     setResultsProps(fcProps);
     setWarning(fcProps?.warning ?? null);
     api.getAnalysisRuns(pid).then(setRuns).catch(() => setRuns([]));
+    api.getExportAvailability(pid).then(setExportsAvail)
+      .catch(() => setExportsAvail(null));
 
     map.addSource("hillshade", {
       type: "image",
@@ -627,6 +671,14 @@ export default function App() {
     });
 
     map.addSource("results", { type: "geojson", data: fc });
+    map.addLayer({
+      id: "contours",
+      type: "line",
+      source: "results",
+      filter: ["==", ["get", "kind"], "contour"],
+      paint: { "line-color": "#9a938a", "line-width": 0.7,
+               "line-opacity": 0.7 },
+    });
     map.addLayer({
       id: "valleys",
       type: "line",
@@ -1024,16 +1076,18 @@ export default function App() {
         {terrainSource === "dtm" && (
           <DtmPanel
             projectId={projectId}
+            initialDtmId={dtmId}
             analyzeDisabledReason={
-              !projectId
-                ? "Draw or import an AOI first."
-                : busy
-                  ? "An analysis is already running."
-                  : areaTooBig
-                    ? "The AOI exceeds the size limit."
-                    : null
+              busy
+                ? "An analysis is already running."
+                : areaTooBig
+                  ? "The AOI exceeds the size limit."
+                  : null
             }
-            onAnalyze={(dtmId) => void analyze({ dtmId })}
+            onLocate={(dtm) => void locateDtm(dtm)}
+            onDtmSelected={setDtmId}
+            onAnalyze={(id, terrain) =>
+              void analyze({ dtmId: id, terrain: terrain as Record<string, number> })}
           />
         )}
 
@@ -1067,26 +1121,52 @@ export default function App() {
           </button>
           {exportOpen && hasResults && (
             <div className="export-menu">
+              {([
+                ["keylines.geojson", "Keylines only (GeoJSON)",
+                 exportsAvail?.keylines_geojson ?? false],
+                ["keylines.kml", "Keylines only (KML)",
+                 exportsAvail?.keylines_kml ?? false],
+                ["keylines.dxf", "Keylines (DXF for CAD)",
+                 exportsAvail?.keylines_dxf ?? false],
+                ["terrain.gpkg", "Full terrain package (GeoPackage)",
+                 exportsAvail?.gpkg ?? false],
+              ] as [string, string, boolean][]).map(([kind, label, ok]) => (
+                <button
+                  key={kind}
+                  disabled={!ok}
+                  title={ok ? label
+                    : exportsAvail?.unavailable_reason ??
+                      "Not available for this result"}
+                  onClick={() => {
+                    if (projectId) window.open(api.exportUrl(projectId, kind), "_blank");
+                    setExportOpen(false);
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
               <button
                 onClick={() => {
                   void exportGeoJSON();
                   setExportOpen(false);
                 }}
               >
-                GeoJSON (diagnostic layers)
+                All layers (GeoJSON)
               </button>
               <button
-                disabled={(resultsProps?.counts?.keylines ?? 0) === 0}
-                title={(resultsProps?.counts?.keylines ?? 0) === 0
-                  ? "No valid keyline exists in this result"
-                  : "Styled KML for Google Earth"}
                 onClick={() => {
                   if (projectId) window.open(api.exportKmlUrl(projectId), "_blank");
                   setExportOpen(false);
                 }}
               >
-                KML keyline design
+                All layers (KML)
               </button>
+              {!exportsAvail?.keylines_geojson &&
+                exportsAvail?.unavailable_reason && (
+                <div className="muted export-reason">
+                  {exportsAvail.unavailable_reason}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1101,6 +1181,9 @@ export default function App() {
               <div className="muted">
                 No valid keypoint found in this AOI — no candidate keyline was
                 generated.
+                {(resultsProps.keypoint_reasons ?? []).map((r, i) => (
+                  <div key={i}>• {r}</div>
+                ))}
               </div>
             )}
             {resultsProps.notices?.includes("KEYLINE_GENERATION_BLOCKED") && (
@@ -1195,6 +1278,17 @@ export default function App() {
               />
               <span className="swatch" style={{ background: "#888" }} />
               Hillshade
+            </label>
+            )}
+            {hasResults && (
+            <label>
+              <input
+                type="checkbox"
+                checked={visible.contours}
+                onChange={() => toggleLayer("contours")}
+              />
+              <span className="swatch" style={{ background: "#9a938a" }} />
+              Contours
             </label>
             )}
             {hasResults && (<>

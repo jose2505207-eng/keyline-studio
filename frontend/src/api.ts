@@ -145,7 +145,7 @@ export async function attachMap(projectId: string, mapId: string): Promise<void>
 
 export async function startAnalysis(
   projectId: string,
-  options: { dtmId?: string; demMode?: string } = {}
+  options: { dtmId?: string; demMode?: string; terrain?: Record<string, number> } = {}
 ): Promise<string> {
   const res = await fetch(url(`/api/projects/${projectId}/analyze`), {
     method: "POST",
@@ -153,6 +153,7 @@ export async function startAnalysis(
     body: JSON.stringify({
       dtm_id: options.dtmId ?? null,
       dem_mode: options.demMode ?? "auto",
+      terrain: options.terrain ?? null,
     }),
   });
   const body = await jsonOrThrow(res);
@@ -468,8 +469,12 @@ export interface ResultsProperties {
   analysis_run_id?: string | null;
   analysis_crs?: string;
   dem_bounds_wgs84?: number[];
-  counts?: ResultCounts;
+  counts?: ResultCounts & { contours?: number };
   notices?: string[];
+  keypoint_reasons?: string[];
+  status?: string;
+  bbox_wgs84?: number[];
+  center_wgs84?: number[];
   qa?: QAReport | null;
   qa_mode?: string;
   watermark?: string | null;
@@ -537,6 +542,11 @@ export interface Dtm {
   survey_id: string | null;
   project_id: string | null;
   resolution_m: number[] | null;
+  bbox_wgs84: number[] | null;
+  center_wgs84: number[] | null;
+  footprint_geojson: GeoJSON.Geometry | null;
+  elevation_range_m: number[] | null;
+  valid_pct: number | null;
 }
 
 export interface DtmPathValidation {
@@ -608,4 +618,32 @@ export async function importDtmPath(
     }),
   });
   return jsonOrThrow(res);
+}
+
+// ---- DTM detail + specialized exports -----------------------------------------
+
+export async function getDtm(dtmId: string): Promise<Dtm> {
+  return jsonOrThrow(await fetch(url(`/api/dtms/${dtmId}`)));
+}
+
+export interface ExportAvailability {
+  geojson: boolean;
+  kml: boolean;
+  keylines_geojson: boolean;
+  keylines_kml: boolean;
+  keylines_dxf: boolean;
+  gpkg: boolean;
+  unavailable_reason: string | null;
+}
+
+export async function getExportAvailability(
+  projectId: string
+): Promise<ExportAvailability> {
+  return jsonOrThrow(
+    await fetch(url(`/api/projects/${projectId}/exports/availability`))
+  );
+}
+
+export function exportUrl(projectId: string, kind: string): string {
+  return url(`/api/projects/${projectId}/exports/${kind}`);
 }

@@ -5,6 +5,11 @@ import type { Dtm } from "./api";
 import DtmPanel from "./DtmPanel";
 
 const READY_DTM: Dtm = {
+  bbox_wgs84: [-98.091, 30.1704, -98.0892, 30.1723],
+  center_wgs84: [-98.0901, 30.1713],
+  footprint_geojson: null,
+  elevation_range_m: [268.3, 407.2],
+  valid_pct: 73.1,
   id: "dtm_abc123",
   display_name: "caliterra-dtm.tif",
   original_filename: "caliterra-dtm.tif",
@@ -43,7 +48,7 @@ afterEach(() => {
 describe("DtmPanel", () => {
   it("shows the empty state when no DTMs exist", async () => {
     mockFetchList([]);
-    render(<DtmPanel projectId="p1" onAnalyze={() => {}} />);
+    render(<DtmPanel projectId="p1" onLocate={() => {}} onAnalyze={() => {}} />);
     expect(
       await screen.findByText(
         /No saved DTMs yet\. Upload a GeoTIFF or generate one from a drone survey\./
@@ -54,7 +59,7 @@ describe("DtmPanel", () => {
   it("lists DTMs and shows selected metadata + Ready status", async () => {
     mockFetchList([READY_DTM]);
     const user = userEvent.setup();
-    render(<DtmPanel projectId="p1" onAnalyze={() => {}} />);
+    render(<DtmPanel projectId="p1" onLocate={() => {}} onAnalyze={() => {}} />);
     const select = await screen.findByLabelText("Saved DTMs");
     await user.selectOptions(select, "dtm_abc123");
     const card = await screen.findByTestId("dtm-selected");
@@ -68,7 +73,7 @@ describe("DtmPanel", () => {
     mockFetchList([READY_DTM]);
     const onAnalyze = vi.fn();
     const user = userEvent.setup();
-    render(<DtmPanel projectId="p1" onAnalyze={onAnalyze} />);
+    render(<DtmPanel projectId="p1" onLocate={() => {}} onAnalyze={onAnalyze} />);
     const analyze = await screen.findByRole("button", {
       name: /Analyze with selected DTM/,
     });
@@ -80,13 +85,13 @@ describe("DtmPanel", () => {
     await user.selectOptions(screen.getByLabelText("Saved DTMs"), "dtm_abc123");
     expect(analyze).toBeEnabled();
     await user.click(analyze);
-    expect(onAnalyze).toHaveBeenCalledWith("dtm_abc123");
+    expect(onAnalyze).toHaveBeenCalledWith("dtm_abc123", {});
   });
 
   it("upload button opens the hidden file input", async () => {
     mockFetchList([]);
     const user = userEvent.setup();
-    render(<DtmPanel projectId="p1" onAnalyze={() => {}} />);
+    render(<DtmPanel projectId="p1" onLocate={() => {}} onAnalyze={() => {}} />);
     const input = (await screen.findByTestId(
       "dtm-file-input"
     )) as HTMLInputElement;
@@ -101,7 +106,7 @@ describe("DtmPanel", () => {
   it("rejects a non-TIFF file before uploading", async () => {
     mockFetchList([]);
     const user = userEvent.setup({ applyAccept: false });
-    render(<DtmPanel projectId="p1" onAnalyze={() => {}} />);
+    render(<DtmPanel projectId="p1" onLocate={() => {}} onAnalyze={() => {}} />);
     const input = (await screen.findByTestId(
       "dtm-file-input"
     )) as HTMLInputElement;
@@ -142,7 +147,7 @@ describe("DtmPanel", () => {
     vi.stubGlobal("XMLHttpRequest", FakeXHR as unknown as typeof XMLHttpRequest);
 
     const user = userEvent.setup();
-    render(<DtmPanel projectId="p1" onAnalyze={() => {}} />);
+    render(<DtmPanel projectId="p1" onLocate={() => {}} onAnalyze={() => {}} />);
     const input = (await screen.findByTestId(
       "dtm-file-input"
     )) as HTMLInputElement;
@@ -156,7 +161,7 @@ describe("DtmPanel", () => {
   it("keeps the custom server path section collapsed by default", async () => {
     mockFetchList([]);
     const user = userEvent.setup();
-    render(<DtmPanel projectId="p1" onAnalyze={() => {}} />);
+    render(<DtmPanel projectId="p1" onLocate={() => {}} onAnalyze={() => {}} />);
     const toggle = await screen.findByRole("button", {
       name: /Advanced: use a custom server filepath/,
     });
@@ -177,7 +182,7 @@ describe("DtmPanel", () => {
     // a missing DTM is not selectable from the dropdown; a stale selection
     // that later goes missing must clear on refresh
     mockFetchList([{ ...READY_DTM, status: "missing" }]);
-    render(<DtmPanel projectId="p1" onAnalyze={() => {}} />);
+    render(<DtmPanel projectId="p1" onLocate={() => {}} onAnalyze={() => {}} />);
     await waitFor(() =>
       expect(
         screen.getByText(/Some DTMs reference files that no longer exist/)
@@ -199,6 +204,7 @@ describe("DtmPanel", () => {
       <DtmPanel
         projectId={null}
         analyzeDisabledReason="Draw or import an AOI first."
+        onLocate={() => {}}
         onAnalyze={() => {}}
       />
     );
@@ -208,5 +214,72 @@ describe("DtmPanel", () => {
       screen.getByRole("button", { name: /Analyze with selected DTM/ })
     ).toBeDisabled();
     expect(screen.getByText("Draw or import an AOI first.")).toBeInTheDocument();
+  });
+});
+
+describe("DtmPanel locate flow", () => {
+  function mockListAndDetail(list: Dtm[], detail: Dtm) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const u = String(input);
+        if (/\/api\/dtms\/dtm_/.test(u)) {
+          return new Response(JSON.stringify(detail), { status: 200 });
+        }
+        if (u.includes("/api/dtms")) {
+          return new Response(JSON.stringify({ items: list }), { status: 200 });
+        }
+        throw new Error(`unexpected fetch ${u}`);
+      })
+    );
+  }
+
+  it("fires onLocate with the DTM bbox after selection (map fitBounds hook)", async () => {
+    mockListAndDetail([READY_DTM], READY_DTM);
+    const onLocate = vi.fn();
+    const user = userEvent.setup();
+    render(<DtmPanel projectId="p1" onLocate={onLocate} onAnalyze={() => {}} />);
+    await user.selectOptions(
+      await screen.findByLabelText("Saved DTMs"), "dtm_abc123");
+    await waitFor(() => expect(onLocate).toHaveBeenCalled());
+    const dtm = onLocate.mock.calls[0][0] as Dtm;
+    // EPSG:32614 raster must land in Texas, not Europe
+    expect(dtm.bbox_wgs84?.[0]).toBeCloseTo(-98.091, 2);
+    expect(dtm.bbox_wgs84?.[1]).toBeCloseTo(30.17, 1);
+  });
+
+  it("restores a persisted selection on reload and locates it", async () => {
+    mockListAndDetail([READY_DTM], READY_DTM);
+    const onLocate = vi.fn();
+    render(
+      <DtmPanel
+        projectId="p1"
+        initialDtmId="dtm_abc123"
+        onLocate={onLocate}
+        onAnalyze={() => {}}
+      />
+    );
+    await waitFor(() => expect(onLocate).toHaveBeenCalled());
+    expect(
+      await screen.findByTestId("dtm-selected")
+    ).toHaveTextContent("caliterra-dtm.tif");
+  });
+
+  it("keeps the advanced terrain parameters section collapsed and passes values through", async () => {
+    mockListAndDetail([READY_DTM], READY_DTM);
+    const onAnalyze = vi.fn();
+    const user = userEvent.setup();
+    render(<DtmPanel projectId="p1" onLocate={() => {}} onAnalyze={onAnalyze} />);
+    expect(screen.queryByText(/Contour interval/)).not.toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", { name: /Advanced terrain parameters/ }));
+    const contour = screen.getByLabelText(/Contour interval/);
+    await user.type(contour, "2.5");
+    await user.selectOptions(screen.getByLabelText("Saved DTMs"), "dtm_abc123");
+    await user.click(
+      screen.getByRole("button", { name: /Analyze with selected DTM/ }));
+    expect(onAnalyze).toHaveBeenCalledWith("dtm_abc123", {
+      contour_interval_m: 2.5,
+    });
   });
 });

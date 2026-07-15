@@ -21,13 +21,30 @@ function fmtDate(t: number): string {
   });
 }
 
-interface Props {
-  projectId: string | null;
-  analyzeDisabledReason?: string | null; // non-DTM reasons (no AOI, busy...)
-  onAnalyze: (dtmId: string) => void;
+export interface TerrainParams {
+  contour_interval_m?: number;
+  smooth_sigma_px?: number;
+  min_drainage_area_m2?: number;
+  min_line_length_m?: number;
+  min_valley_length_m?: number;
+  min_keypoint_confidence?: number;
 }
 
-export default function DtmPanel({ projectId, analyzeDisabledReason, onAnalyze }: Props) {
+interface Props {
+  projectId: string | null;
+  analyzeDisabledReason?: string | null; // non-DTM reasons (busy...)
+  initialDtmId?: string | null;
+  /** Fired with full DTM detail (footprint/bbox) whenever selection lands —
+   * the app flies the map there and may adopt the footprint as the AOI. */
+  onLocate: (dtm: api.Dtm) => void;
+  onDtmSelected?: (id: string | null) => void;
+  onAnalyze: (dtmId: string, terrain: TerrainParams) => void;
+}
+
+export default function DtmPanel({
+  projectId, analyzeDisabledReason, initialDtmId, onLocate, onDtmSelected,
+  onAnalyze,
+}: Props) {
   const [dtms, setDtms] = useState<api.Dtm[] | null>(null); // null = loading
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -38,6 +55,10 @@ export default function DtmPanel({ projectId, analyzeDisabledReason, onAnalyze }
   const [pathResult, setPathResult] = useState<api.DtmPathValidation | null>(null);
   const [copyToLibrary, setCopyToLibrary] = useState(true);
   const [importing, setImporting] = useState(false);
+  const [locating, setLocating] = useState(false);
+  const [detail, setDetail] = useState<api.Dtm | null>(null);
+  const [paramsOpen, setParamsOpen] = useState(false);
+  const [terrain, setTerrain] = useState<Record<string, string>>({});
   const fileRef = useRef<HTMLInputElement>(null);
 
   const refresh = useCallback(async () => {
@@ -61,6 +82,50 @@ export default function DtmPanel({ projectId, analyzeDisabledReason, onAnalyze }
   }, [refresh]);
 
   const selected = dtms?.find((d) => d.id === selectedId) ?? null;
+
+  // restore a persisted selection (page reload)
+  useEffect(() => {
+    if (initialDtmId && dtms && !selectedId &&
+        dtms.some((d) => d.id === initialDtmId && d.status === "ready")) {
+      setSelectedId(initialDtmId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dtms, initialDtmId]);
+
+  // whenever the selection lands on a ready DTM, read its geography and
+  // hand it to the map ("Reading terrain and locating property…")
+  useEffect(() => {
+    onDtmSelected?.(selectedId);
+    setDetail(null);
+    if (!selectedId) return;
+    let cancelled = false;
+    setLocating(true);
+    void (async () => {
+      try {
+        const d = await api.getDtm(selectedId);
+        if (cancelled) return;
+        setDetail(d);
+        if (d.status === "ready" && d.bbox_wgs84) onLocate(d);
+      } catch {
+        /* selection stays; map simply doesn't move */
+      } finally {
+        if (!cancelled) setLocating(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId]);
+
+  const parseTerrain = (): TerrainParams => {
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(terrain)) {
+      const n = parseFloat(v);
+      if (v.trim() !== "" && isFinite(n)) out[k] = n;
+    }
+    return out;
+  };
 
   // ------------------------------------------------------------- upload
   const onFilePicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -154,6 +219,10 @@ export default function DtmPanel({ projectId, analyzeDisabledReason, onAnalyze }
         </select>
       )}
 
+      {locating && (
+        <div className="muted">Reading terrain and locating property…</div>
+      )}
+
       {selected && (
         <div className="dtm-selected" data-testid="dtm-selected">
           <b>Selected: {selected.display_name}</b>
@@ -175,6 +244,12 @@ export default function DtmPanel({ projectId, analyzeDisabledReason, onAnalyze }
           <div className={selected.status === "ready" ? "dtm-ready" : "warn"}>
             Status: {selected.status === "ready" ? "Ready" : selected.status}
           </div>
+          {detail?.elevation_range_m && (
+            <div className="muted">
+              Elevation {detail.elevation_range_m[0]}–{detail.elevation_range_m[1]} m
+              {detail.valid_pct != null ? ` · ${detail.valid_pct}% valid data` : ""}
+            </div>
+          )}
         </div>
       )}
 
@@ -258,9 +333,47 @@ export default function DtmPanel({ projectId, analyzeDisabledReason, onAnalyze }
 
       <button
         type="button"
+        className="linkish"
+        aria-expanded={paramsOpen}
+        onClick={() => setParamsOpen((o) => !o)}
+      >
+        {paramsOpen ? "▾" : "▸"} Advanced terrain parameters
+      </button>
+      {paramsOpen && (
+        <div className="dtm-advanced">
+          {([
+            ["contour_interval_m", "Contour interval (m, 0=auto)"],
+            ["smooth_sigma_px", "Smoothing sigma (px)"],
+            ["min_drainage_area_m2", "Min contributing area (m²)"],
+            ["min_line_length_m", "Valley/ridge min length (m)"],
+            ["min_valley_length_m", "Min keyline valley length (m)"],
+            ["min_keypoint_confidence", "Keypoint confidence (0–1)"],
+          ] as [string, string][]).map(([key, label]) => (
+            <label key={key} className="dtm-param">
+              <span>{label}</span>
+              <input
+                type="text"
+                inputMode="decimal"
+                placeholder="default"
+                value={terrain[key] ?? ""}
+                onChange={(e) =>
+                  setTerrain((t) => ({ ...t, [key]: e.target.value }))
+                }
+              />
+            </label>
+          ))}
+          <div className="muted">
+            Depression filling always runs; DSM inputs distort keylines —
+            prefer a bare-earth DTM.
+          </div>
+        </div>
+      )}
+
+      <button
+        type="button"
         className="primary"
         disabled={disabledReason !== null}
-        onClick={() => selected && onAnalyze(selected.id)}
+        onClick={() => selected && onAnalyze(selected.id, parseTerrain())}
       >
         ▶ Analyze with selected DTM
       </button>

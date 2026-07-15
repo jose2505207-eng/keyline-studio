@@ -8,6 +8,8 @@ reprojection, fusion, persistence, and job-progress logging.
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Callable
@@ -22,6 +24,8 @@ from shapely.ops import transform as shp_transform
 
 from . import dem_source, fusion, terrain
 from .hydrology import get_engine
+
+log = logging.getLogger(__name__)
 
 MAX_AOI_KM2 = 100.0
 MAX_GRID_CELLS = 25_000_000  # memory guard when running at drone resolution
@@ -40,6 +44,26 @@ class Params:
     relief_warn_m: float = 15.0            # satellite relief below this -> reliability warning
     relief_reject_m: float = 6.0           # satellite relief below this -> no keypoints/keylines
     min_aoi_px: int = 40                   # AOIs under ~40x40 satellite pixels -> warning
+    contour_interval_m: float = 0.0        # 0 = auto (~12 lines over the relief)
+
+
+# User-tunable subset (the "Advanced terrain parameters" UI); anything else
+# in a request's params dict is ignored rather than trusted.
+TUNABLE_PARAMS = {
+    "min_drainage_area_m2", "min_line_length_m", "min_valley_length_m",
+    "min_keypoint_confidence", "smooth_sigma_px", "contour_interval_m",
+}
+
+
+def params_from_dict(raw: dict | None) -> Params:
+    kwargs = {}
+    for key in TUNABLE_PARAMS:
+        if raw and key in raw:
+            try:
+                kwargs[key] = float(raw[key])
+            except (TypeError, ValueError):
+                pass
+    return Params(**kwargs)
 
 
 def assess_terrain_quality(dem_values: np.ndarray, has_drone: bool,
@@ -84,6 +108,7 @@ class TerrainResult:
     keypoints: list[dict] = field(default_factory=list)  # {point, elevation, confidence, valley_idx}
     keylines: list[dict] = field(default_factory=list)   # {line, keypoint_idx}
     conditioned_dem: np.ndarray | None = None
+    flow_accumulation: np.ndarray | None = None
 
 
 def run_terrain_analysis(
@@ -103,6 +128,7 @@ def run_terrain_analysis(
     progress(f"hydrological conditioning + flow routing ({engine.name})")
     conditioned, facc = engine.flow_accumulation(dem, transform)
     res.conditioned_dem = conditioned
+    res.flow_accumulation = facc
 
     progress("extracting valleys")
     res.valleys = terrain.extract_stream_lines(
@@ -182,7 +208,8 @@ def _utm_grid_for_aoi(aoi_wgs84) -> tuple[str, object]:
 def _write_outputs(out_dir: str, dem_da: xr.DataArray, result: TerrainResult,
                    ctx, drone_weight: np.ndarray | None,
                    extra_properties: dict | None = None,
-                   notices: list[str] | None = None):
+                   notices: list[str] | None = None,
+                   contour_interval_m: float = 0.0):
     """Clip vectors to the AOI, validate them, reproject to WGS84 exactly
     once, gate them against the run's spatial context, and write atomically.
 
@@ -216,6 +243,45 @@ def _write_outputs(out_dir: str, dem_da: xr.DataArray, result: TerrainResult,
     # ---- build vectors in the ANALYSIS CRS ---------------------------------
     valley_lines = [g for v in result.valleys for g in clip_lines(v)]
     ridge_lines = [g for r in result.ridges for g in clip_lines(r)]
+
+    # ---- contours (elevation isolines, kept muted in the UI) ---------------
+    contour_lines: list[tuple[float, object]] = []
+    with np.errstate(all="ignore"):
+        v = dem[np.isfinite(dem)]
+    if v.size:
+        relief = float(np.percentile(v, 99) - np.percentile(v, 1))
+        interval = float(contour_interval_m or 0.0)
+        if interval <= 0:
+            # auto: ~12 lines snapped to a friendly step
+            raw = max(relief / 12.0, 0.1)
+            for nice in (0.1, 0.2, 0.25, 0.5, 1, 2, 2.5, 5, 10, 20, 25, 50, 100):
+                if raw <= nice:
+                    interval = nice
+                    break
+            else:
+                interval = 100.0
+        lo = math.floor(float(np.percentile(v, 1)) / interval) * interval
+        hi = float(np.percentile(v, 99))
+        levels = []
+        level = lo + interval
+        while level < hi and len(levels) < 40:  # hard cap
+            levels.append(level)
+            level += interval
+        from skimage import measure as _measure
+
+        work = np.where(np.isnan(dem), float(np.nanmin(dem)) - 1000.0, dem)
+        for lv in levels:
+            try:
+                conts = _measure.find_contours(work, lv)
+            except ValueError:
+                continue
+            for cont in conts:
+                if len(cont) < 4:
+                    continue
+                xs, ys = transform * (cont[:, 1] + 0.5, cont[:, 0] + 0.5)
+                line = LineString(np.column_stack([xs, ys])).simplify(cell)
+                for part in clip_lines(line):
+                    contour_lines.append((lv, part))
 
     # ridge == valley geometry is a contradiction, not a landform
     dupe_notices = spatial.check_terrain_sets(valley_lines, ridge_lines,
@@ -263,35 +329,111 @@ def _write_outputs(out_dir: str, dem_da: xr.DataArray, result: TerrainResult,
                            "source": source},
         })
 
+    # slope grid for keyline attributes (computed once, only if needed)
+    slope_grid = None
+    if result.keylines:
+        with np.errstate(all="ignore"):
+            gy, gx = np.gradient(dem, cell)
+            slope_grid = np.hypot(gx, gy).astype("float32")
+
     keyline_count = 0
     for kl in result.keylines:
         kid = kp_ids[kl["keypoint_idx"]]
         if kid is None:
             continue
+        kp = result.keypoints[kl["keypoint_idx"]]
         for g in clip_lines(kl["line"]):
             keyline_count += 1
+            # attributes useful in field-layout exports
+            (x0, y0), (x1, y1) = g.coords[0], g.coords[-1]
+            bearing = (math.degrees(math.atan2(x1 - x0, y1 - y0)) + 360) % 180
+            avg_slope = None
+            if slope_grid is not None:
+                n = min(max(int(g.length / cell), 2), 200)
+                pts = [g.interpolate(d) for d in
+                       np.linspace(0, g.length, n)]
+                cols_rows = [~transform * (p.x, p.y) for p in pts]
+                samples = [slope_grid[int(r), int(c)] for c, r in cols_rows
+                           if 0 <= int(r) < slope_grid.shape[0]
+                           and 0 <= int(c) < slope_grid.shape[1]]
+                finite = [s for s in samples if np.isfinite(s)]
+                if finite:
+                    avg_slope = round(100 * float(np.mean(finite)), 1)
             features.append({"type": "Feature",
                              "geometry": mapping(shp_transform(to_wgs, g)),
-                             "properties": {"kind": "keyline",
-                                            "keypoint_id": kid,
-                                            "id": f"l{kl['keypoint_idx']}"}})
+                             "properties": {
+                                 "kind": "keyline",
+                                 "keypoint_id": kid,
+                                 "id": f"l{kl['keypoint_idx']}",
+                                 "elevation": round(kp["elevation"], 2),
+                                 "confidence": round(kp["confidence"], 3),
+                                 "length_m": round(g.length, 1),
+                                 "avg_slope_pct": avg_slope,
+                                 "bearing_deg": round(bearing, 1),
+                                 "analysis_run_id": ctx.analysis_run_id,
+                             }})
+
+    for i, (lv, g) in enumerate(contour_lines):
+        features.append({"type": "Feature",
+                         "geometry": mapping(shp_transform(to_wgs, g)),
+                         "properties": {"kind": "contour", "id": f"c{i}",
+                                        "elevation": round(lv, 2)}})
 
     counts = {"valleys": len(valley_lines), "ridges": len(ridge_lines),
-              "keypoints": kp_count, "keylines": keyline_count}
+              "keypoints": kp_count, "keylines": keyline_count,
+              "contours": len(contour_lines)}
+    log.info("terrain features run=%s: %s", ctx.analysis_run_id, counts)
+
+    keypoint_reasons: list[str] = []
     if kp_count == 0:
-        # honest semantics: not a software failure, but no keyline design
+        # honest semantics: not a software failure, but no keyline design —
+        # explain the most likely cause instead of a bare zero
         notices.append("NO_VALID_KEYPOINT")
+        props_in = extra_properties or {}
+        if "KEYLINE_GENERATION_BLOCKED" in notices:
+            keypoint_reasons.append(
+                "Terrain-quality checks blocked keyline generation "
+                "(strict mode).")
+        if props_in.get("keylines_suppressed"):
+            keypoint_reasons.append(
+                "Terrain relief is below the satellite reliability floor.")
+        if v.size and relief < 3.0:
+            keypoint_reasons.append(
+                f"Terrain is nearly flat ({relief:.1f} m of relief).")
+        if v.size < 40 * 40:
+            keypoint_reasons.append(
+                "The AOI covers very few raster cells — enlarge it.")
+        if not valley_lines:
+            keypoint_reasons.append(
+                "No drainage lines emerged — the minimum contributing "
+                "area may be too large for this parcel.")
+        if not keypoint_reasons:
+            keypoint_reasons.append(
+                "No clear valley transition (slope break) was detected on "
+                "any drainage line; try lowering the keypoint confidence "
+                "threshold in advanced parameters.")
 
     fc = {"type": "FeatureCollection", "features": features}
     props = dict(extra_properties or {})
+    qa_props = props.get("qa") or {}
+    status = "completed"
+    if qa_props.get("severe") or props.get("watermark") or \
+            [n for n in notices if n != "NO_VALID_KEYPOINT"] or \
+            (kp_count == 0 and qa_props.get("issues")):
+        status = "completed_with_warnings"
+    w_, s_, e_, n_ = ctx.dem_bounds_wgs84
     props.update({
         "project_id": ctx.project_id,
         "survey_id": ctx.survey_id,
         "analysis_run_id": ctx.analysis_run_id,
         "analysis_crs": ctx.analysis_crs,
         "dem_bounds_wgs84": [round(v, 6) for v in ctx.dem_bounds_wgs84],
+        "bbox_wgs84": [round(v, 6) for v in ctx.dem_bounds_wgs84],
+        "center_wgs84": [round((w_ + e_) / 2, 6), round((s_ + n_) / 2, 6)],
+        "status": status,
         "counts": counts,
         "notices": notices,
+        "keypoint_reasons": keypoint_reasons,
     })
     fc["properties"] = props  # foreign member (RFC 7946 §6.1)
 
@@ -562,7 +704,25 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
     spatial_mod.atomic_write_json(os.path.join(out_dir, "meta.json"),
                                   {"utm_crs": utm_crs})
 
+    # persist derived rasters alongside the DEM for downstream use
+    if result.flow_accumulation is not None:
+        facc_da = dem_da.copy(
+            data=result.flow_accumulation.astype("float32"))
+        facc_da.rio.write_nodata(np.nan, inplace=True)
+        facc_da.rio.to_raster(os.path.join(out_dir, "flow_accumulation.tif"),
+                              compress="LZW")
+    with np.errstate(all="ignore"):
+        gy, gx = np.gradient(dem, abs(dem_da.rio.transform().a))
+        slope_da = dem_da.copy(data=np.hypot(gx, gy).astype("float32"))
+    slope_da.rio.write_nodata(np.nan, inplace=True)
+    slope_da.rio.to_raster(os.path.join(out_dir, "slope.tif"),
+                           compress="LZW")
+
+    log.info("analysis run=%s project=%s dem_mode=%s analysis_crs=%s "
+             "dem_crs=%s bounds_wgs84=%s", analysis_run_id, project_id,
+             dem_mode, utm_crs, dem_crs, ctx.dem_bounds_wgs84)
     fc = _write_outputs(out_dir, dem_da, result, ctx, drone_weight,
+                        contour_interval_m=params.contour_interval_m,
                         extra_properties={
                             "warning": quality["warning"],
                             "relief_m": quality["relief_m"],

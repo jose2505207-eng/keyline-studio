@@ -16,7 +16,7 @@ import time
 from typing import Callable
 
 from .. import config, db
-from ..pipeline import run_pipeline
+from ..pipeline import params_from_dict, run_pipeline
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +72,7 @@ def execute_analysis_run(run_id: str,
             project_dir, project["aoi"],
             drone_path=dem_path,
             progress=progress,
+            params=params_from_dict(params.get("terrain")),
             dem_mode=params.get("dem_mode", "auto"),
             out_dir=out_dir,
             survey_id=run.get("survey_id"),

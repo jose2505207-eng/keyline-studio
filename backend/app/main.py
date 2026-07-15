@@ -188,6 +188,7 @@ def _run_job(jid: str, rid: str):
 class AnalyzeIn(BaseModel):
     dtm_id: str | None = None
     dem_mode: str = "auto"
+    terrain: dict | None = None  # advanced terrain parameters (whitelisted)
 
 
 @app.post("/api/projects/{pid}/analyze")
@@ -219,7 +220,8 @@ def analyze(pid: str, background: BackgroundTasks,
     rid = db.create_analysis_run(pid, survey_id, dem_path,
                                  {"trigger": "analyze",
                                   "dem_mode": body.dem_mode,
-                                  "dtm_id": body.dtm_id})
+                                  "dtm_id": body.dtm_id,
+                                  "terrain": body.terrain})
     background.add_task(_run_job, jid, rid)
     return {"job_id": jid, "run_id": rid}
 
@@ -286,6 +288,7 @@ class ReanalyzeIn(BaseModel):
     survey_id: str | None = None   # pick a specific survey's DTM
     dtm_id: str | None = None      # pick a library DTM (preferred)
     dem_mode: str = "auto"
+    terrain: dict | None = None    # advanced terrain parameters (whitelisted)
 
 
 @app.post("/api/projects/{pid}/reanalyze")
@@ -325,7 +328,9 @@ def reanalyze(pid: str, body: ReanalyzeIn):
 
     rid = db.create_analysis_run(pid, survey_id, dem_path,
                                  {"trigger": "reanalyze",
-                                  "dem_mode": body.dem_mode})
+                                  "dem_mode": body.dem_mode,
+                                  "dtm_id": body.dtm_id,
+                                  "terrain": body.terrain})
     from .jobs import QueueUnavailable, get_queue
 
     try:
@@ -368,6 +373,86 @@ def get_analysis_run(pid: str, rid: str):
     if run is None or run["project_id"] != pid:
         raise HTTPException(404, "Analysis run not found in this project")
     return _run_out(run)
+
+
+# ---------------------------------------------------------------------------
+# Specialized exports (keylines-only, GeoPackage, DXF)
+
+
+def _load_results(pid: str) -> dict:
+    path = os.path.join(_results_dir(pid), "results.geojson")
+    if not os.path.exists(path):
+        raise HTTPException(404, "No results yet — run analyze first")
+    with open(path) as f:
+        return json.load(f)
+
+
+@app.get("/api/projects/{pid}/exports/availability")
+def exports_availability(pid: str):
+    from .exports import export_availability
+
+    _require_project(pid)
+    return export_availability(_load_results(pid))
+
+
+@app.get("/api/projects/{pid}/exports/keylines.geojson")
+def export_keylines_geojson(pid: str):
+    from .exports import ExportUnavailable, keylines_geojson
+
+    _require_project(pid)
+    try:
+        sub = keylines_geojson(_load_results(pid))
+    except ExportUnavailable as exc:
+        raise HTTPException(409, str(exc))
+    return JSONResponse(sub, headers={
+        "Content-Disposition":
+            f'attachment; filename="keyline-{pid}-keylines.geojson"'})
+
+
+@app.get("/api/projects/{pid}/exports/keylines.kml")
+def export_keylines_kml(pid: str):
+    from fastapi.responses import Response
+
+    from .exports import ExportUnavailable, keylines_kml
+
+    proj = _require_project(pid)
+    try:
+        kml_text = keylines_kml(_load_results(pid),
+                                f"Keylines — {proj['name']}")
+    except ExportUnavailable as exc:
+        raise HTTPException(409, str(exc))
+    return Response(content=kml_text,
+                    media_type="application/vnd.google-earth.kml+xml",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="keyline-{pid}-keylines.kml"'})
+
+
+@app.get("/api/projects/{pid}/exports/terrain.gpkg")
+def export_terrain_gpkg(pid: str):
+    from .exports import ExportUnavailable, terrain_gpkg
+
+    _require_project(pid)
+    out = os.path.join(_results_dir(pid), "terrain.gpkg")
+    try:
+        terrain_gpkg(_load_results(pid), out)
+    except ExportUnavailable as exc:
+        raise HTTPException(409, str(exc))
+    return FileResponse(out, media_type="application/geopackage+sqlite3",
+                        filename=f"keyline-{pid}-terrain.gpkg")
+
+
+@app.get("/api/projects/{pid}/exports/keylines.dxf")
+def export_keylines_dxf(pid: str):
+    from .exports import ExportUnavailable, keylines_dxf
+
+    _require_project(pid)
+    out = os.path.join(_results_dir(pid), "keylines.dxf")
+    try:
+        keylines_dxf(_load_results(pid), out)
+    except ExportUnavailable as exc:
+        raise HTTPException(409, str(exc))
+    return FileResponse(out, media_type="application/dxf",
+                        filename=f"keyline-{pid}-keylines.dxf")
 
 
 # ---------------------------------------------------------------------------

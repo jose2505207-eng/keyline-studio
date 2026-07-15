@@ -24,6 +24,7 @@ pysheds>=0.4
 # Boundary import/export (KML/KMZ) and map-scan PDFs
 fastkml>=1.4
 pypdfium2>=5.0
+ezdxf>=1.4          # DXF keyline export for CAD/field layout
 
 # Drone photogrammetry stack
 pyodm>=1.5          # official NodeODM client

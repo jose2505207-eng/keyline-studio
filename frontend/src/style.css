@@ -741,3 +741,18 @@ body,
   font-size: 12px;
   padding: 5px 6px;
 }
+
+.dtm-param {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+}
+
+.dtm-param input {
+  width: 72px;
+  padding: 3px 5px;
+  border: 1px solid #bbb;
+  border-radius: 4px;
+  font-size: 12px;
+}

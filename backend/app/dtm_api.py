@@ -96,6 +96,39 @@ def inspect_dtm_raster(path: str) -> dict:
             raise DtmPathError(
                 f"Elevations {lo:.0f}..{hi:.0f} m are outside -500..9000 m — "
                 "is this really a terrain model?")
+        # geographic footprint: valid-data outline when computable cheaply
+        # (decimated mask), else the raster bounds — always in EPSG:4326
+        from pyproj import Transformer
+        from rasterio import features as rio_features
+        from shapely.geometry import box as shp_box
+        from shapely.geometry import mapping, shape as shp_shape
+        from shapely.ops import transform as shp_transform, unary_union
+
+        to_wgs = Transformer.from_crs(src.crs, "EPSG:4326",
+                                      always_xy=True).transform
+        bounds_poly = shp_box(*src.bounds)
+        footprint = bounds_poly
+        try:
+            scale_x = src.width / arr.shape[1]
+            scale_y = src.height / arr.shape[0]
+            dec_transform = src.transform * src.transform.scale(scale_x,
+                                                                scale_y)
+            valid = (~np.ma.getmaskarray(arr)).astype("uint8")
+            polys = [shp_shape(geom) for geom, val in
+                     rio_features.shapes(valid, transform=dec_transform)
+                     if val == 1]
+            if polys:
+                merged = unary_union(polys).simplify(
+                    max(abs(dec_transform.a), abs(dec_transform.e)))
+                if not merged.is_empty:
+                    footprint = merged
+        except Exception:  # noqa: BLE001 — bounds footprint is a fine fallback
+            pass
+        footprint_wgs = shp_transform(to_wgs, footprint)
+        bbox_poly_wgs = shp_transform(to_wgs, bounds_poly)
+        w_, s_, e_, n_ = bbox_poly_wgs.bounds
+        centroid = footprint_wgs.centroid
+
         return {
             "crs": str(src.crs),
             "width": src.width,
@@ -106,6 +139,10 @@ def inspect_dtm_raster(path: str) -> dict:
             "resolution_m": [round(abs(src.res[0]), 4),
                              round(abs(src.res[1]), 4)],
             "elevation_range_m": [round(lo, 1), round(hi, 1)],
+            "bbox_wgs84": [round(v, 7) for v in (w_, s_, e_, n_)],
+            "center_wgs84": [round(centroid.x, 7), round(centroid.y, 7)],
+            "footprint_geojson": mapping(footprint_wgs),
+            "valid_pct": round(100.0 * float((~np.ma.getmaskarray(arr)).mean()), 1),
         }
 
 
@@ -203,6 +240,12 @@ class DtmOut(BaseModel):
     survey_id: str | None
     project_id: str | None
     resolution_m: list[float] | None = None
+    # geographic placement (EPSG:4326) so the frontend can fly to the DTM
+    bbox_wgs84: list[float] | None = None
+    center_wgs84: list[float] | None = None
+    footprint_geojson: dict | None = None
+    elevation_range_m: list[float] | None = None
+    valid_pct: float | None = None
 
 
 class DtmListOut(BaseModel):
@@ -225,7 +268,7 @@ class ImportPathIn(BaseModel):
     project_id: str | None = None
 
 
-def _dtm_out(d: dict) -> DtmOut:
+def _dtm_out(d: dict, include_footprint: bool = True) -> DtmOut:
     meta = d.get("metadata_json") or {}
     return DtmOut(
         id=d["id"], display_name=d["display_name"],
@@ -236,6 +279,12 @@ def _dtm_out(d: dict) -> DtmOut:
         nodata=d.get("nodata"), survey_id=d.get("survey_id"),
         project_id=d.get("project_id"),
         resolution_m=meta.get("resolution_m"),
+        bbox_wgs84=meta.get("bbox_wgs84"),
+        center_wgs84=meta.get("center_wgs84"),
+        footprint_geojson=(meta.get("footprint_geojson")
+                           if include_footprint else None),
+        elevation_range_m=meta.get("elevation_range_m"),
+        valid_pct=meta.get("valid_pct"),
     )
 
 
@@ -248,7 +297,25 @@ def list_dtms():
     ensure_dtm_dir()
     register_survey_dtms()
     items = [refresh_dtm_status(d) for d in db.list_dtms()]
-    return DtmListOut(items=[_dtm_out(d) for d in items])
+    # list stays light: bbox/center included, full footprint via detail
+    return DtmListOut(items=[_dtm_out(d, include_footprint=False)
+                             for d in items])
+
+
+def _backfill_placement(d: dict) -> dict:
+    """Records registered before geographic placement existed get their
+    footprint computed on first detail access."""
+    meta = d.get("metadata_json") or {}
+    if meta.get("bbox_wgs84") or d["status"] != "ready":
+        return d
+    try:
+        meta.update(inspect_dtm_raster(d["storage_path"]))
+        db.update_dtm(d["id"], metadata_json=meta, crs=meta["crs"],
+                      width=meta["width"], height=meta["height"])
+        d = {**d, "metadata_json": meta}
+    except DtmPathError as exc:
+        log.warning("placement backfill failed for %s: %s", d["id"], exc)
+    return d
 
 
 @router.get("/{dtm_id}", response_model=DtmOut)
@@ -256,7 +323,12 @@ def get_dtm(dtm_id: str):
     d = db.get_dtm(dtm_id)
     if d is None:
         raise HTTPException(404, "DTM not found")
-    return _dtm_out(refresh_dtm_status(d))
+    d = refresh_dtm_status(d)
+    d = _backfill_placement(d)
+    log.info("dtm detail: id=%s crs=%s bbox_wgs84=%s status=%s",
+             d["id"], d.get("crs"),
+             (d.get("metadata_json") or {}).get("bbox_wgs84"), d["status"])
+    return _dtm_out(d)
 
 
 @router.post("/upload", response_model=DtmOut)

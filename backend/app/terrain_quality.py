@@ -44,10 +44,11 @@ class QAIssue:
     code: str
     severity: str
     message: str
+    details: dict = field(default_factory=dict)  # exact triggering values
 
     def to_dict(self) -> dict:
         return {"code": self.code, "severity": self.severity,
-                "message": self.message}
+                "message": self.message, "details": self.details}
 
 
 @dataclass
@@ -122,6 +123,16 @@ def assess_dtm(dtm_path: str, *, aoi_coverage: float | None = None,
     report = QAReport(mode=mode)
     with rasterio.open(dtm_path) as src:
         res_x, res_y = abs(src.res[0]), abs(src.res[1])
+        crs = src.crs
+        # horizontal-unit validation: slope math needs meters. A geographic
+        # CRS (degree units) would make a 10 m hill look like a 1000% grade,
+        # so convert resolution to approximate meters at the raster's
+        # latitude before any gradient is computed.
+        crs_is_projected = bool(crs and crs.is_projected)
+        if not crs_is_projected:
+            lat = (src.bounds.bottom + src.bounds.top) / 2.0
+            res_x = res_x * 111_320.0 * max(math.cos(math.radians(lat)), 0.05)
+            res_y = res_y * 110_570.0
         width_m = src.width * res_x
         height_m = src.height * res_y
         a = src.read(1, masked=True)
@@ -189,17 +200,82 @@ def assess_dtm(dtm_path: str, *, aoi_coverage: float | None = None,
         "checkpoints_supplied": checkpoints_supplied,
     }
 
+    # ---- optional satellite cross-check (runs FIRST: it decides whether a
+    # dominant plane is real topography or an orientation error) -------------
+    sat_grad = None
+    sat_angle = None
+    if satellite_surface is not None:
+        try:
+            sat_z, sat_rx, sat_ry = satellite_surface()
+            sat_coef, _ = _fit_plane(np.asarray(sat_z, dtype="float64"),
+                                     sat_rx, sat_ry, step=1)
+            sat_grad = float(np.hypot(sat_coef[0], sat_coef[1]))
+            if plane_grad > 1e-6 and sat_grad > 1e-6:
+                dot = (coef[0] * sat_coef[0] + coef[1] * sat_coef[1]) / (
+                    plane_grad * sat_grad)
+                sat_angle = math.degrees(math.acos(max(-1.0, min(1.0, dot))))
+            report.metrics["satellite_plane_slope_pct"] = round(100 * sat_grad, 1)
+            report.metrics["satellite_gradient_angle_diff_deg"] = (
+                round(sat_angle, 1) if sat_angle is not None else None)
+        except Exception as exc:  # noqa: BLE001 — cross-check is best-effort
+            log.warning("satellite cross-check unavailable: %s", exc)
+            report.metrics["satellite_check"] = f"unavailable: {exc}"
+
     # ---- issues ------------------------------------------------------------
-    if plane_slope_pct > tilt_threshold_pct and \
-            residual_relief < 0.5 * (robust_relief or 1.0):
+    # A dominant plane by itself is NOT proof of a tilted reconstruction —
+    # plenty of real ranches are smooth 25-45% hillsides. Severity therefore
+    # requires independent confirmation (satellite disagrees on the
+    # large-scale gradient) or an absurd plane no natural parcel exhibits.
+    # Uncertain cases warn and let analysis continue.
+    plane_dominant = (plane_slope_pct > tilt_threshold_pct
+                      and residual_relief < 0.5 * (robust_relief or 1.0))
+    sat_disagrees = (sat_grad is not None
+                     and abs(plane_grad - sat_grad) > 0.15
+                     and plane_grad > 2.0 * sat_grad + 0.05)
+    sat_agrees = (sat_grad is not None and not sat_disagrees)
+    tilt_details = {
+        "plane_slope_pct": round(plane_slope_pct, 1),
+        "plane_slope_deg": round(plane_slope_deg, 1),
+        "residual_relief_m": round(residual_relief, 2),
+        "robust_relief_m": round(robust_relief, 2),
+        "tilt_threshold_pct": tilt_threshold_pct,
+        "satellite_plane_slope_pct": (round(100 * sat_grad, 1)
+                                      if sat_grad is not None else None),
+        "satellite_gradient_angle_diff_deg": (round(sat_angle, 1)
+                                              if sat_angle is not None
+                                              else None),
+        "crs_is_projected": crs_is_projected,
+    }
+
+    if sat_disagrees:
         report.issues.append(QAIssue(
             SUSPECT_GLOBAL_TILT, SEVERE,
-            f"The DTM is dominated by a {plane_slope_pct:.0f}% "
-            f"({plane_slope_deg:.0f}°) global plane; residual terrain after "
-            f"plane removal is only {residual_relief:.1f} m of "
-            f"{robust_relief:.1f} m total relief. This is characteristic of "
-            "a tilted reconstruction (insufficient ground control), not real "
-            "topography."))
+            f"The drone surface slopes {plane_slope_pct:.0f}% while "
+            f"satellite elevation over the same footprint slopes "
+            f"{100 * sat_grad:.0f}% "
+            + (f"with gradients {sat_angle:.0f}° apart " if sat_angle else "")
+            + "— a gross large-scale orientation disagreement, not natural "
+              "terrain.", details=tilt_details))
+    elif plane_dominant and plane_slope_pct > 70.0 and not sat_agrees:
+        # no independent data, but no natural parcel is a smooth 70%+ plane
+        report.issues.append(QAIssue(
+            SUSPECT_GLOBAL_TILT, SEVERE,
+            f"The DTM is a nearly perfect {plane_slope_pct:.0f}% "
+            f"({plane_slope_deg:.0f}°) plane with only "
+            f"{residual_relief:.1f} m of residual terrain — implausible as "
+            "natural topography even without reference data.",
+            details=tilt_details))
+    elif plane_dominant and not sat_agrees:
+        # uncertain: could be a smooth natural hillside — warn, don't block
+        report.issues.append(QAIssue(
+            SUSPECT_GLOBAL_TILT, WARNING,
+            f"The DTM is dominated by a {plane_slope_pct:.0f}% plane "
+            f"(residual terrain {residual_relief:.1f} m of "
+            f"{robust_relief:.1f} m). This can be a naturally smooth "
+            "hillside or a tilted reconstruction; no reference elevation "
+            "was available to distinguish them. Results are usable but "
+            "verify the orientation in the field.", details=tilt_details))
+    # satellite agreeing with a steep plane = a genuinely sloped ranch: fine.
 
     footprint_diag = math.hypot(width_m, height_m)
     if robust_relief > relief_footprint_ratio * footprint_diag:
@@ -208,7 +284,10 @@ def assess_dtm(dtm_path: str, *, aoi_coverage: float | None = None,
             f"{robust_relief:.0f} m of relief across a "
             f"{footprint_diag:.0f} m footprint "
             f"({100 * robust_relief / footprint_diag:.0f}% of the diagonal) "
-            "is implausible for most survey sites."))
+            "is implausible for most survey sites.",
+            details={"robust_relief_m": round(robust_relief, 2),
+                     "footprint_diag_m": round(footprint_diag, 1),
+                     "ratio_threshold": relief_footprint_ratio}))
 
     if not gcp_supplied:
         report.issues.append(QAIssue(
@@ -220,35 +299,6 @@ def assess_dtm(dtm_path: str, *, aoi_coverage: float | None = None,
                 INSUFFICIENT_GROUND_CONTROL, WARNING,
                 "The reconstruction shows orientation problems and had no "
                 "ground control — re-fly with GCPs or add a gcp_list.txt."))
-
-    # ---- optional satellite cross-check ------------------------------------
-    if satellite_surface is not None:
-        try:
-            sat_z, sat_rx, sat_ry = satellite_surface()
-            sat_coef, _ = _fit_plane(np.asarray(sat_z, dtype="float64"),
-                                     sat_rx, sat_ry, step=1)
-            sat_grad = float(np.hypot(sat_coef[0], sat_coef[1]))
-            grad_diff = abs(plane_grad - sat_grad)
-            angle = None
-            if plane_grad > 1e-6 and sat_grad > 1e-6:
-                dot = (coef[0] * sat_coef[0] + coef[1] * sat_coef[1]) / (
-                    plane_grad * sat_grad)
-                angle = math.degrees(math.acos(max(-1.0, min(1.0, dot))))
-            report.metrics["satellite_plane_slope_pct"] = round(100 * sat_grad, 1)
-            report.metrics["satellite_gradient_angle_diff_deg"] = (
-                round(angle, 1) if angle is not None else None)
-            # satellite DEM only detects LARGE-scale orientation errors
-            if grad_diff > 0.15 and plane_grad > 2.0 * sat_grad + 0.05:
-                if not any(i.code == SUSPECT_GLOBAL_TILT for i in report.issues):
-                    report.issues.append(QAIssue(
-                        SUSPECT_GLOBAL_TILT, SEVERE,
-                        f"Drone surface slopes {100 * plane_grad:.0f}% while "
-                        f"satellite elevation over the same footprint slopes "
-                        f"{100 * sat_grad:.0f}% — gross large-scale tilt "
-                        "disagreement."))
-        except Exception as exc:  # noqa: BLE001 — cross-check is best-effort
-            log.warning("satellite cross-check unavailable: %s", exc)
-            report.metrics["satellite_check"] = f"unavailable: {exc}"
 
     return report
 

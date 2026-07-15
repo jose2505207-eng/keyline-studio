@@ -402,6 +402,39 @@ gentle terrain, so unguarded D8 routing renders noise. The pipeline now:
   separate folders, keypoint confidence + source in descriptions, plus the
   AOI boundary) — opens directly in Google Earth and re-imports cleanly.
 
+## Existing-DTM workflow
+
+Selecting or uploading a DTM is automatic end to end: the backend reads the
+GeoTIFF's own CRS (never hard-coded, never inherited from a previous DTM)
+and returns `bbox_wgs84` / `center_wgs84` / `footprint_geojson`; the map
+fits to the footprint (padded, zoom-capped) and draws it; if no AOI exists
+the footprint becomes the default AOI (editable afterwards); analysis runs
+against the selected `dtm_id` and renders valleys, ridges, keypoints,
+keylines, and contour lines without a page refresh.
+
+Result contract: results carry `status`
+(`completed | completed_with_warnings | failed`), `counts` (incl.
+`contours`), `notices`, `keypoint_reasons` (why no keypoint was found, when
+none was), `bbox_wgs84`/`center_wgs84`, and the full `qa` report whose
+issues include a `details` payload with the exact triggering values.
+
+**Global-tilt QA**: a dominant plane alone is no longer treated as proof of
+a tilted reconstruction — smooth 25–45% hillsides are real ranches. The
+check is severe only when satellite elevation over the same footprint
+*disagrees* with the drone surface's large-scale gradient (or the plane is
+absurd, >70% with almost no residual terrain); otherwise it is a warning
+and analysis continues. Geographic-CRS rasters get their resolution
+converted to meters before any slope math.
+
+**Exports** (`/api/projects/{id}/exports/…`): keylines-only GeoJSON/KML/DXF
+and a multi-layer GeoPackage, alongside the full GeoJSON/KML. Keyline
+features carry `elevation`, `confidence`, `length_m`, `avg_slope_pct`,
+`bearing_deg`, `keypoint_id`, and `analysis_run_id`. Keyline-specific
+downloads are refused (HTTP 409, with the real reason) when the analysis
+produced no keylines. Advanced terrain parameters (contour interval,
+smoothing, minimum contributing area, line lengths, keypoint confidence)
+can be tuned per run from the DTM panel.
+
 ## Managed DTM library
 
 Terrain source → **Existing DTM** is backed by a managed library so users
