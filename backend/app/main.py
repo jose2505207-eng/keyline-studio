@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, UploadFile
@@ -12,6 +13,21 @@ from pydantic import BaseModel
 
 from . import db, pipeline
 from .dem_source import DemSourceError
+
+log = logging.getLogger(__name__)
+
+# Surface our own INFO diagnostics (project store location, project lookup
+# misses, analyze resolution). uvicorn attaches handlers only to its own
+# loggers and leaves the root without one, so records from the "app" logger
+# would otherwise be dropped — attach a dedicated handler.
+_app_logger = logging.getLogger("app")
+_app_logger.setLevel(
+    getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO))
+if not _app_logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(levelname)s:%(name)s: %(message)s"))
+    _app_logger.addHandler(_h)
+    _app_logger.propagate = False
 
 DATA_DIR = os.environ.get(
     "KEYLINE_DATA", os.path.join(os.path.dirname(__file__), "..", "data")
@@ -34,6 +50,17 @@ def _startup():
     from .dtm_api import ensure_dtm_dir
 
     ensure_dtm_dir()
+    # Surface where project metadata lives. On hosts without a persistent
+    # disk (e.g. Render free tier) this path is wiped on every redeploy, so
+    # browser-stored project IDs go stale — the frontend recreates projects
+    # from the AOI + selected DTM automatically when that happens. Only an
+    # explicit KEYLINE_DB (pointed at a mounted volume) is a reliable
+    # persistence signal; an unset default should be treated as ephemeral.
+    explicitly_configured = bool(os.environ.get("KEYLINE_DB"))
+    log.info("project store: db=%s persistence_configured=%s dtm_dir=%s "
+             "(unconfigured stores may reset on redeploy; clients auto-recover)",
+             os.path.abspath(db.DB_PATH), explicitly_configured,
+             os.path.abspath(ensure_dtm_dir()))
     # Surveys stranded mid-flight by a crash/restart are resumed or returned
     # to a recoverable state (never falsely completed).
     try:
@@ -70,6 +97,8 @@ class MoveIn(BaseModel):
 def _require_project(pid: str) -> dict:
     proj = db.get_project(pid)
     if proj is None:
+        log.info("project lookup MISS id=%s db=%s (stale/ephemeral — client "
+                 "will recreate)", pid, os.path.abspath(db.DB_PATH))
         raise HTTPException(404, "Project not found")
     return proj
 
@@ -81,7 +110,23 @@ def create_project(body: ProjectIn):
         raise HTTPException(422, "aoi must be a GeoJSON Polygon")
     pid = db.create_project(body.name, geom)
     os.makedirs(project_dir(pid), exist_ok=True)
+    log.info("project created id=%s name=%r", pid, body.name)
     return {"project_id": pid}
+
+
+@app.get("/api/projects/{pid}")
+def get_project(pid: str):
+    """Lightweight existence + summary check so the frontend can validate a
+    browser-stored project id before analyzing (and recreate it if stale)."""
+    proj = _require_project(pid)
+    run = db.latest_completed_run(pid)
+    return {
+        "project_id": pid,
+        "name": proj["name"],
+        "has_drone_dtm": bool(proj.get("drone_path")
+                              and os.path.isfile(proj["drone_path"])),
+        "has_results": bool(run and run.get("result_dir")),
+    }
 
 
 @app.post("/api/projects/{pid}/drone-dem")
@@ -207,6 +252,8 @@ def analyze(pid: str, background: BackgroundTasks,
         dtm, dem_path = resolve_dtm_for_analysis(body.dtm_id)
         survey_id = dtm.get("survey_id")
         db.set_drone_path(pid, dem_path)  # keypoint-move + legacy reuse
+        log.info("analyze project=%s dtm_id=%s dtm_path=%s survey=%s mode=%s",
+                 pid, body.dtm_id, dem_path, survey_id, body.dem_mode)
     else:
         dem_path = proj.get("drone_path")
         if dem_path and not os.path.isfile(dem_path):

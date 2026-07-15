@@ -6,6 +6,7 @@ import * as api from "./api";
 import DroneSurveyPanel from "./DroneSurveyPanel";
 import DtmPanel from "./DtmPanel";
 import GeorefModal from "./GeorefModal";
+import { resolveProject } from "./projectFlow";
 
 const STORAGE_KEY = "keyline.active";
 
@@ -47,6 +48,21 @@ interface SearchResult {
   lon: string;
 }
 
+function polygonBbox(poly: GeoJSON.Polygon): [number, number, number, number] {
+  const xs = poly.coordinates[0].map((c) => c[0]);
+  const ys = poly.coordinates[0].map((c) => c[1]);
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+
+/** Do two WGS84 bboxes [w,s,e,n] overlap at all? Used to decide whether a
+ * previously-drawn AOI belongs to the DTM the user is now analyzing. */
+function bboxesOverlap(
+  a: [number, number, number, number],
+  b: [number, number, number, number]
+): boolean {
+  return a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1];
+}
+
 /** Spherical polygon area (same approach as turf.area), in km². */
 function ringAreaKm2(ring: [number, number][]): number {
   if (ring.length < 3) return 0;
@@ -69,6 +85,7 @@ export default function App() {
   const pollRef = useRef<number | null>(null);
   const projectIdRef = useRef<string | null>(null);
   const lastGeocodeRef = useRef(0);
+  const lastDtmRef = useRef<api.Dtm | null>(null);
 
   const [projectId, setProjectId] = useState<string | null>(null);
   const [drawing, setDrawing] = useState(false);
@@ -515,29 +532,128 @@ export default function App() {
   // ------------------------------------------------------------- drone DEM
 
   // --------------------------------------------------------------- analysis
-  const analyze = async (options: { dtmId?: string; demMode?: string; terrain?: Record<string, number> } = {}) => {
-    if (!projectId) return;
+
+  /** Start analysis on a known-good project and poll to completion. Throws
+   * synchronously if the project 404s (caller recreates + retries). */
+  const runAnalysisOn = async (
+    pid: string,
+    options: { dtmId?: string; demMode?: string; terrain?: Record<string, number> }
+  ) => {
+    await api.startAnalysis(pid, options); // 404 here => stale project
+    setJobState("running:analyzing terrain");
+    pollRef.current = window.setInterval(async () => {
+      try {
+        const st = await api.getStatus(pid);
+        setJobLog(st.log.map((l) => l.msg));
+        if (st.state === "done") {
+          stopPolling();
+          setJobState("running:drawing keylines");
+          await loadResults(pid);
+          setJobState("done");
+          setBusy(false);
+        } else if (st.state.startsWith("error:")) {
+          stopPolling();
+          setJobState(st.state);
+          setBusy(false);
+        } else {
+          setJobState(st.state);
+        }
+      } catch {
+        /* transient poll failure — keep polling */
+      }
+    }, 2000);
+  };
+
+  /** Resolve the analysis area. For a DTM run it is the DTM footprint unless
+   * the user has drawn an AOI that actually overlaps the DTM. */
+  const resolveAoi = (isDtmRun: boolean): GeoJSON.Polygon | null => {
+    const dtm = lastDtmRef.current;
+    const footprint: GeoJSON.Polygon | null =
+      isDtmRun && dtm?.bbox_wgs84
+        ? {
+            type: "Polygon",
+            coordinates: [
+              [
+                [dtm.bbox_wgs84[0], dtm.bbox_wgs84[1]],
+                [dtm.bbox_wgs84[2], dtm.bbox_wgs84[1]],
+                [dtm.bbox_wgs84[2], dtm.bbox_wgs84[3]],
+                [dtm.bbox_wgs84[0], dtm.bbox_wgs84[3]],
+                [dtm.bbox_wgs84[0], dtm.bbox_wgs84[1]],
+              ],
+            ],
+          }
+        : null;
+    const drawn = aoiRef.current;
+    if (isDtmRun && footprint && dtm?.bbox_wgs84) {
+      if (drawn && bboxesOverlap(polygonBbox(drawn), dtm.bbox_wgs84 as
+          [number, number, number, number])) {
+        return drawn; // a real AOI drawn over this DTM
+      }
+      // no AOI, or a stale AOI from another parcel -> use the DTM footprint
+      aoiRef.current = footprint;
+      setAoiOnMap(footprint);
+      setAreaKm2(ringAreaKm2(footprint.coordinates[0] as [number, number][]));
+      return footprint;
+    }
+    return drawn;
+  };
+
+  /** Validate the stored project, creating a fresh one from the AOI when it
+   * is missing or the backend no longer has it (ephemeral-store reset). */
+  const ensureProject = async (aoi: GeoJSON.Polygon): Promise<string> => {
+    if (projectIdRef.current) setJobState("running:validating project");
+    const { projectId: pid, created } = await resolveProject(
+      projectIdRef.current, aoi);
+    if (created) {
+      setJobState(
+        projectIdRef.current
+          ? "running:the previous project record was unavailable — creating " +
+              "a new project from the selected area"
+          : "running:creating project"
+      );
+      setProjectId(pid);
+      projectIdRef.current = pid;
+      aoiRef.current = aoi;
+    }
+    return pid;
+  };
+
+  const analyze = async (
+    options: { dtmId?: string; demMode?: string; terrain?: Record<string, number> } = {}
+  ) => {
+    const aoi = resolveAoi(Boolean(options.dtmId));
+    if (!aoi) {
+      setJobState("error:Draw or import an area — or select a DTM — before analyzing.");
+      return;
+    }
     clearResults();
     setBusy(true);
     setJobLog([]);
     try {
-      await api.startAnalysis(projectId, options);
-      setJobState("queued");
-      pollRef.current = window.setInterval(async () => {
-        try {
-          const st = await api.getStatus(projectId);
-          setJobState(st.state);
-          setJobLog(st.log.map((l) => l.msg));
-          if (st.state === "done" || st.state.startsWith("error:")) {
-            stopPolling();
-            setBusy(false);
-            if (st.state === "done") await loadResults(projectId);
-          }
-        } catch {
-          /* transient poll failure — keep polling */
-        }
-      }, 2000);
+      let pid = await ensureProject(aoi);
+      if (options.dtmId) setJobState("running:attaching DTM");
+      try {
+        await runAnalysisOn(pid, options);
+      } catch (err) {
+        // The project vanished between validation and the analyze call
+        // (ephemeral reset race) — recreate once and retry, no loop.
+        if (!/not found/i.test((err as Error).message)) throw err;
+        setProjectId(null);
+        projectIdRef.current = null;
+        setJobState(
+          "running:the previous project record was unavailable — recreating " +
+            "from the selected DTM"
+        );
+        pid = await api.createProject(
+          `AOI ${new Date().toISOString().slice(0, 16)}`,
+          aoi
+        );
+        setProjectId(pid);
+        projectIdRef.current = pid;
+        await runAnalysisOn(pid, options);
+      }
     } catch (err) {
+      stopPolling();
       setJobState(`error:${(err as Error).message}`);
       setBusy(false);
     }
@@ -552,11 +668,18 @@ export default function App() {
   useEffect(() => stopPolling, []);
 
   // -------------------------------------------------------- DTM locate flow
-  const locateDtm = useCallback(async (dtm: api.Dtm) => {
+  const locateDtm = useCallback((dtm: api.Dtm) => {
     const map = mapRef.current;
     if (!map || !dtm.bbox_wgs84) return;
-    // stale layers from a previously selected DTM must never linger
-    clearResults();
+    const switching = lastDtmRef.current?.id !== dtm.id;
+    lastDtmRef.current = dtm;
+    // switching to a different DTM invalidates the current project/results —
+    // a fresh project bound to this footprint is created at Analyze time
+    if (switching) {
+      clearResults();
+      setProjectId(null);
+      projectIdRef.current = null;
+    }
     const [w, s, e, n] = dtm.bbox_wgs84;
     map.fitBounds([[w, s], [e, n]], {
       padding: 70,
@@ -574,14 +697,16 @@ export default function App() {
                      properties: {} }],
       });
     }
-    // no AOI yet? adopt the DTM footprint so analysis can start immediately
-    // (the user can redraw a smaller AOI afterwards)
-    if (!projectIdRef.current) {
-      const ring: [number, number][] = [
-        [w, s], [e, s], [e, n], [w, n], [w, s],
-      ];
-      await adoptAoi({ type: "Polygon", coordinates: [ring] });
-    }
+    // show the DTM footprint as the working AOI immediately (editable). No
+    // project is created here — ensureProject() does that at Analyze time so
+    // a stale project id from a previous session cannot cause a 404.
+    const ring: [number, number][] = [
+      [w, s], [e, s], [e, n], [w, n], [w, s],
+    ];
+    const poly: GeoJSON.Polygon = { type: "Polygon", coordinates: [ring] };
+    aoiRef.current = poly;
+    setAoiOnMap(poly);
+    setAreaKm2(ringAreaKm2(ring));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -863,6 +988,15 @@ export default function App() {
 
   const rerunAnalysis = async () => {
     if (!projectId) return;
+    // If the backend lost this project (ephemeral reset), fall through to the
+    // full create-then-analyze workflow instead of a reanalyze 404.
+    const existing = await api.getProject(projectId).catch(() => null);
+    if (!existing) {
+      setProjectId(null);
+      projectIdRef.current = null;
+      await analyze({ dtmId: lastDtmRef.current?.id });
+      return;
+    }
     setRerunning(true);
     setJobState("");
     try {

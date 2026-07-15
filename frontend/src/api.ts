@@ -49,6 +49,21 @@ export async function createProject(name: string, aoi: GeoJSON.Polygon): Promise
   return body.project_id;
 }
 
+export interface ProjectSummary {
+  project_id: string;
+  name: string;
+  has_drone_dtm: boolean;
+  has_results: boolean;
+}
+
+/** Returns the project summary, or null when the backend has no such project
+ * (e.g. a stale browser id after the server's ephemeral store was reset). */
+export async function getProject(projectId: string): Promise<ProjectSummary | null> {
+  const res = await fetch(url(`/api/projects/${projectId}`));
+  if (res.status === 404) return null;
+  return jsonOrThrow(res);
+}
+
 export interface DroneInfo {
   crs: string;
   resolution_m: [number, number];
