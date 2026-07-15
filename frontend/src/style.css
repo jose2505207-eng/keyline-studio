@@ -661,3 +661,83 @@ body,
   border-top: 1px solid #ddd;
   padding-top: 6px;
 }
+
+/* ---- DTM library panel ---- */
+
+.dtm-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 13px;
+}
+
+.dtm-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.dtm-panel select {
+  padding: 6px 8px;
+  border: 1px solid #bbb;
+  border-radius: 6px;
+  font-size: 13px;
+  max-width: 100%;
+}
+
+.dtm-empty {
+  border: 1px dashed #ccc;
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.dtm-selected {
+  background: #f2f7f2;
+  border: 1px solid #cfe3cf;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.dtm-ready {
+  color: #14691b;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.dtm-advanced {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: #f7f7f7;
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 12px;
+}
+
+.dtm-advanced input[type="text"] {
+  padding: 5px 7px;
+  border: 1px solid #bbb;
+  border-radius: 5px;
+  font-size: 12px;
+  font-family: monospace;
+}
+
+.dtm-copy {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.dtm-path-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.dtm-path-actions button {
+  flex: 1;
+  font-size: 12px;
+  padding: 5px 6px;
+}

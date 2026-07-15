@@ -195,3 +195,26 @@ def qa_relief_footprint_ratio() -> float:
 
 def result_bounds_buffer_m() -> float:
     return _float("RESULT_BOUNDS_BUFFER_M", 50.0)
+
+
+# --- DTM library --------------------------------------------------------------
+
+def dtm_storage_dir() -> str:
+    """Managed DTM library directory. Compose sets /data/dtm (shared bind
+    mount); bare dev defaults to <data dir>/dtm."""
+    return os.environ.get("DTM_STORAGE_DIR",
+                          os.path.join(data_dir(), "dtm"))
+
+
+def dtm_allowed_external_roots() -> list[str]:
+    """Roots a custom server filepath may live under. The data dir and the
+    DTM library itself are always allowed so bare-dev setups work without
+    extra configuration."""
+    raw = os.environ.get("DTM_ALLOWED_EXTERNAL_ROOTS", "/data,/app/data")
+    roots = [r.strip() for r in raw.split(",") if r.strip()]
+    roots.extend([data_dir(), dtm_storage_dir()])
+    return roots
+
+
+def dtm_max_upload_mb() -> int:
+    return _int("DTM_MAX_UPLOAD_MB", 1024)

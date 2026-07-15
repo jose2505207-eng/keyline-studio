@@ -250,3 +250,94 @@ def update_analysis_run(rid: str, **fields) -> None:
     vals.append(rid)
     with _conn() as c:
         c.execute(f"UPDATE analysis_runs SET {', '.join(cols)} WHERE id=?", vals)
+
+
+# ---------------------------------------------------------------------------
+# DTM library
+
+
+def _dtm_row_to_dict(row) -> dict:
+    d = dict(row)
+    if d.get("metadata_json") is not None:
+        try:
+            d["metadata_json"] = json.loads(d["metadata_json"])
+        except (TypeError, json.JSONDecodeError):
+            pass
+    return d
+
+
+def create_dtm(*, storage_path: str, display_name: str,
+               original_filename: str | None, source_type: str,
+               size_bytes: int | None, checksum: str | None,
+               crs: str | None, width: int | None, height: int | None,
+               nodata: float | None, survey_id: str | None = None,
+               project_id: str | None = None, status: str = "ready",
+               metadata: dict | None = None) -> str:
+    did = "dtm_" + uuid.uuid4().hex[:12]
+    now = time.time()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO dtms (id, storage_path, display_name, "
+            "original_filename, source_type, status, size_bytes, checksum, "
+            "crs, width, height, nodata, survey_id, project_id, "
+            "metadata_json, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (did, storage_path, display_name, original_filename, source_type,
+             status, size_bytes, checksum, crs, width, height, nodata,
+             survey_id, project_id, json.dumps(metadata or {}), now, now),
+        )
+    return did
+
+
+def get_dtm(did: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM dtms WHERE id=?", (did,)).fetchone()
+    return _dtm_row_to_dict(row) if row else None
+
+
+def list_dtms() -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM dtms ORDER BY created_at DESC").fetchall()
+    return [_dtm_row_to_dict(r) for r in rows]
+
+
+def find_dtm_by_survey(survey_id: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM dtms WHERE survey_id=? LIMIT 1",
+                        (survey_id,)).fetchone()
+    return _dtm_row_to_dict(row) if row else None
+
+
+def find_dtm_by_path(storage_path: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM dtms WHERE storage_path=? LIMIT 1",
+                        (storage_path,)).fetchone()
+    return _dtm_row_to_dict(row) if row else None
+
+
+def update_dtm(did: str, **fields) -> None:
+    if not fields:
+        return
+    cols, vals = [], []
+    for k, v in fields.items():
+        if k == "metadata_json" and isinstance(v, dict):
+            v = json.dumps(v)
+        cols.append(f"{k}=?")
+        vals.append(v)
+    cols.append("updated_at=?")
+    vals.append(time.time())
+    vals.append(did)
+    with _conn() as c:
+        c.execute(f"UPDATE dtms SET {', '.join(cols)} WHERE id=?", vals)
+
+
+def surveys_with_dtm() -> list[dict]:
+    """All surveys that claim a generated DTM, with their project names."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT s.id, s.project_id, s.dtm_path, s.completed_at, "
+            "p.name AS project_name FROM drone_surveys s "
+            "JOIN projects p ON p.id = s.project_id "
+            "WHERE s.dtm_path IS NOT NULL").fetchall()
+    return [dict(r) for r in rows]

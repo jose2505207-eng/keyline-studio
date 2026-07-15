@@ -402,6 +402,47 @@ gentle terrain, so unguarded D8 routing renders noise. The pipeline now:
   separate folders, keypoint confidence + source in descriptions, plus the
   AOI boundary) — opens directly in Google Earth and re-imports cleanly.
 
+## Managed DTM library
+
+Terrain source → **Existing DTM** is backed by a managed library so users
+never handle server paths:
+
+- **Storage**: host `./data/dtm` ↔ container `/data/dtm` (compose binds
+  `./data:/data` into both the API and the worker; `DTM_STORAGE_DIR`
+  configures the location, bare dev defaults to `backend/data/dtm`). The
+  directory is created automatically on startup; GeoTIFFs are gitignored.
+- **Browser upload** (`POST /api/dtms/upload`): streams to a temp file with
+  a `DTM_MAX_UPLOAD_MB` cap (default 1024), validates it is a readable
+  georeferenced raster with plausible elevations (never loading the full
+  raster), then stores it under a collision-safe generated name. The
+  original filename is kept as display metadata only.
+- **Survey-generated DTMs** are discovered automatically: every completed
+  drone survey's DTM is registered in the library (`source_type: survey`)
+  with live availability status — if the file has vanished the entry shows
+  `missing` and cannot be analyzed.
+- **Custom server filepath** (advanced, collapsed by default): for files
+  already on the server. `POST /api/dtms/validate-path` checks the path —
+  it must resolve (symlinks and `..` collapsed) inside
+  `DTM_ALLOWED_EXTERNAL_ROOTS` (default `/data,/app/data`; the data dir is
+  always implicitly allowed), be a readable `.tif`, and open as a raster.
+  `POST /api/dtms/import-path` then copies it into the library (default) or
+  registers it in place. Browser-local paths can never be used here — the
+  browser cannot hand the server a filesystem path; that is what upload is
+  for.
+- **Analysis** submits a stable `dtm_id` (`POST /analyze` and
+  `POST /reanalyze` both accept it); the backend resolves it to a real path
+  and verifies the file exists and is readable *before* anything is queued.
+  Missing/unknown DTMs return 4xx. Reanalysis by `survey_id` keeps working.
+
+Verify that the API and worker share the library:
+
+```bash
+mkdir -p data/dtm
+docker compose up -d --build
+docker compose exec backend find /data/dtm -maxdepth 2 -type f
+docker compose exec worker  find /data/dtm -maxdepth 2 -type f
+```
+
 ## Locate from a map scan
 
 Upload a topographic map image (PNG/JPG) or PDF (page 1 by default; selector

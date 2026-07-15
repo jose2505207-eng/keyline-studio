@@ -143,8 +143,18 @@ export async function attachMap(projectId: string, mapId: string): Promise<void>
   await jsonOrThrow(res);
 }
 
-export async function startAnalysis(projectId: string): Promise<string> {
-  const res = await fetch(url(`/api/projects/${projectId}/analyze`), { method: "POST" });
+export async function startAnalysis(
+  projectId: string,
+  options: { dtmId?: string; demMode?: string } = {}
+): Promise<string> {
+  const res = await fetch(url(`/api/projects/${projectId}/analyze`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      dtm_id: options.dtmId ?? null,
+      dem_mode: options.demMode ?? "auto",
+    }),
+  });
   const body = await jsonOrThrow(res);
   return body.job_id;
 }
@@ -508,4 +518,94 @@ export async function getAnalysisRun(
   return jsonOrThrow(
     await fetch(url(`/api/projects/${projectId}/analysis-runs/${runId}`))
   );
+}
+
+// ---- managed DTM library ------------------------------------------------------
+
+export interface Dtm {
+  id: string;
+  display_name: string;
+  original_filename: string | null;
+  source_type: "upload" | "survey" | "imported_path" | "external_path";
+  status: "ready" | "missing" | string;
+  size_bytes: number | null;
+  created_at: number;
+  crs: string | null;
+  width: number | null;
+  height: number | null;
+  nodata: number | null;
+  survey_id: string | null;
+  project_id: string | null;
+  resolution_m: number[] | null;
+}
+
+export interface DtmPathValidation {
+  valid: boolean;
+  reason: string | null;
+  metadata: {
+    filename: string;
+    size_bytes: number;
+    crs: string;
+    width: number;
+    height: number;
+  } | null;
+}
+
+export async function listDtms(): Promise<Dtm[]> {
+  const body = await jsonOrThrow(await fetch(url("/api/dtms")));
+  return body.items;
+}
+
+export function uploadDtmWithProgress(
+  file: File,
+  projectId: string | null,
+  onProgress: (pct: number) => void
+): Promise<Dtm> {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("file", file);
+    const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url(`/api/dtms/upload${q}`));
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress((e.loaded / e.total) * 100);
+    };
+    xhr.onload = () => {
+      try {
+        const body = JSON.parse(xhr.responseText);
+        if (xhr.status >= 200 && xhr.status < 300) resolve(body as Dtm);
+        else reject(new Error(body.detail ?? `upload failed (${xhr.status})`));
+      } catch {
+        reject(new Error(`upload failed (${xhr.status})`));
+      }
+    };
+    xhr.onerror = () => reject(new Error("network error during upload"));
+    xhr.send(form);
+  });
+}
+
+export async function validateDtmPath(path: string): Promise<DtmPathValidation> {
+  const res = await fetch(url("/api/dtms/validate-path"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  return jsonOrThrow(res);
+}
+
+export async function importDtmPath(
+  path: string,
+  copyToLibrary: boolean,
+  projectId: string | null
+): Promise<Dtm> {
+  const res = await fetch(url("/api/dtms/import-path"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      path,
+      copy_to_library: copyToLibrary,
+      project_id: projectId,
+    }),
+  });
+  return jsonOrThrow(res);
 }

@@ -9,3 +9,7 @@ dist/
 .vercel/
 .env*.local
 .env
+/data/*
+!/data/dtm
+/data/dtm/*
+!/data/dtm/.gitkeep

@@ -4,6 +4,7 @@ import { TerraDraw, TerraDrawPolygonMode } from "terra-draw";
 import { TerraDrawMapLibreGLAdapter } from "terra-draw-maplibre-gl-adapter";
 import * as api from "./api";
 import DroneSurveyPanel from "./DroneSurveyPanel";
+import DtmPanel from "./DtmPanel";
 import GeorefModal from "./GeorefModal";
 
 const STORAGE_KEY = "keyline.active";
@@ -65,7 +66,6 @@ export default function App() {
   const drawRef = useRef<TerraDraw | null>(null);
   const resultsRef = useRef<api.FeatureCollection | null>(null);
   const pollRef = useRef<number | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const projectIdRef = useRef<string | null>(null);
   const lastGeocodeRef = useRef(0);
 
@@ -505,32 +505,15 @@ export default function App() {
   };
 
   // ------------------------------------------------------------- drone DEM
-  const onDroneFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = "";
-    if (!file || !projectId) return;
-    setBusy(true);
-    try {
-      const info = await api.uploadDroneDem(projectId, file);
-      setDroneName(file.name);
-      setDroneInfo(info);
-      setDroneFootprint(info.footprint);
-      setJobState("");
-    } catch (err) {
-      setJobState(`error:${(err as Error).message}`);
-    } finally {
-      setBusy(false);
-    }
-  };
 
   // --------------------------------------------------------------- analysis
-  const analyze = async () => {
+  const analyze = async (options: { dtmId?: string; demMode?: string } = {}) => {
     if (!projectId) return;
     clearResults();
     setBusy(true);
     setJobLog([]);
     try {
-      await api.startAnalysis(projectId);
+      await api.startAnalysis(projectId, options);
       setJobState("queued");
       pollRef.current = window.setInterval(async () => {
         try {
@@ -1039,43 +1022,19 @@ export default function App() {
         )}
 
         {terrainSource === "dtm" && (
-          <>
-            <button
-              disabled={!projectId || busy}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              ⛰ Upload DTM (bare-earth) GeoTIFF{" "}
-              {droneName ? `✓ ${droneName}` : ""}
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".tif,.tiff,image/tiff"
-              style={{ display: "none" }}
-              onChange={onDroneFile}
-            />
-            {droneInfo && (
-              <div className="drone-info">
-                {droneInfo.crs} · {droneInfo.resolution_m[0]} m/px ·{" "}
-                {droneInfo.elevation_range_m[0]}–{droneInfo.elevation_range_m[1]} m —
-                footprint shown in orange; confirm it lands on your parcel.
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={isDsm}
-                    onChange={(e) => setIsDsm(e.target.checked)}
-                  />
-                  This file is a DSM (includes vegetation)
-                </label>
-                {isDsm && (
-                  <div className="dsm-note">
-                    Note: vegetation and structures in a DSM will distort valleys
-                    and keylines — a bare-earth DTM gives design-grade results.
-                  </div>
-                )}
-              </div>
-            )}
-          </>
+          <DtmPanel
+            projectId={projectId}
+            analyzeDisabledReason={
+              !projectId
+                ? "Draw or import an AOI first."
+                : busy
+                  ? "An analysis is already running."
+                  : areaTooBig
+                    ? "The AOI exceeds the size limit."
+                    : null
+            }
+            onAnalyze={(dtmId) => void analyze({ dtmId })}
+          />
         )}
 
         {terrainSource === "satellite" && (
@@ -1085,8 +1044,11 @@ export default function App() {
           </div>
         )}
 
-        {terrainSource !== "drone" && (
-          <button disabled={!projectId || busy || areaTooBig} onClick={analyze}>
+        {terrainSource === "satellite" && (
+          <button
+            disabled={!projectId || busy || areaTooBig}
+            onClick={() => void analyze({ demMode: "satellite_only" })}
+          >
             ▶ Analyze
           </button>
         )}

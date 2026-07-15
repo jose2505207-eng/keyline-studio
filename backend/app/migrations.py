@@ -70,6 +70,31 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON analysis_runs(project_id);
         """,
     ),
+    (
+        3,
+        """
+        CREATE TABLE IF NOT EXISTS dtms (
+            id TEXT PRIMARY KEY,
+            storage_path TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            original_filename TEXT,
+            source_type TEXT NOT NULL DEFAULT 'upload',
+            status TEXT NOT NULL DEFAULT 'ready',
+            size_bytes INTEGER,
+            checksum TEXT,
+            crs TEXT,
+            width INTEGER,
+            height INTEGER,
+            nodata REAL,
+            survey_id TEXT,
+            project_id TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_dtms_survey ON dtms(survey_id);
+        """,
+    ),
 ]
 
 

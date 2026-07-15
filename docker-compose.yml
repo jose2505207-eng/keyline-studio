@@ -14,8 +14,10 @@ services:
       - "8000:8000"
     volumes:
       - backend-data:/app/data
+      - ./data:/data   # shared host dir: managed DTM library lives in /data/dtm
     environment:
       - AWS_NO_SIGN_REQUEST=YES
+      - DTM_STORAGE_DIR=/data/dtm
       - REDIS_URL=redis://redis:6379/0
       - PHOTOGRAMMETRY_PROVIDER=nodeodm
       - NODEODM_URL=http://nodeodm:3000
@@ -47,8 +49,10 @@ services:
     command: rq worker keyline --url redis://redis:6379/0
     volumes:
       - backend-data:/app/data
+      - ./data:/data   # same DTM library as the API
     environment:
       - AWS_NO_SIGN_REQUEST=YES
+      - DTM_STORAGE_DIR=/data/dtm
       - REDIS_URL=redis://redis:6379/0
       - PHOTOGRAMMETRY_PROVIDER=nodeodm
       - NODEODM_URL=http://nodeodm:3000

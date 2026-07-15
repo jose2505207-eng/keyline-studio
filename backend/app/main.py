@@ -31,6 +31,9 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup():
     db.init_db()
+    from .dtm_api import ensure_dtm_dir
+
+    ensure_dtm_dir()
     # Surveys stranded mid-flight by a crash/restart are resumed or returned
     # to a recoverable state (never falsely completed).
     try:
@@ -43,10 +46,11 @@ def _startup():
         logging.getLogger(__name__).warning("survey reconciliation failed: %s", exc)
 
 
-from . import surveys_api  # noqa: E402
+from . import dtm_api, surveys_api  # noqa: E402
 
 app.include_router(surveys_api.router)
 app.include_router(surveys_api.health_router)
+app.include_router(dtm_api.router)
 
 
 def project_dir(pid: str) -> str:
@@ -133,6 +137,24 @@ async def upload_drone_dem(pid: str, file: UploadFile):
         os.remove(dest)
         raise HTTPException(422, f"Not a usable GeoTIFF DTM: {exc}")
     db.set_drone_path(pid, dest)
+    # also register in the managed DTM library so it shows up in the selector
+    from .dtm_api import DtmPathError, inspect_dtm_raster
+
+    if db.find_dtm_by_path(dest) is None:
+        try:
+            meta = inspect_dtm_raster(dest)
+            db.create_dtm(
+                storage_path=dest,
+                display_name=file.filename or "drone_dem.tif",
+                original_filename=file.filename, source_type="upload",
+                size_bytes=meta["size_bytes"], checksum=None,
+                crs=meta["crs"], width=meta["width"], height=meta["height"],
+                nodata=meta["nodata"], project_id=pid, metadata=meta)
+        except DtmPathError as exc:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "legacy DTM upload not registered in library: %s", exc)
     return {"ok": True, **info}
 
 
@@ -147,8 +169,7 @@ def _results_dir(pid: str) -> str:
     return project_dir(pid)
 
 
-def _run_job(jid: str, pid: str):
-    proj = db.get_project(pid)
+def _run_job(jid: str, rid: str):
     from .jobs.terrain_job import execute_analysis_run
 
     try:
@@ -156,8 +177,6 @@ def _run_job(jid: str, pid: str):
             db.update_job(jid, f"running:{step}", log_line=step)
 
         db.update_job(jid, "running:starting", log_line="starting")
-        rid = db.create_analysis_run(pid, None, proj.get("drone_path"),
-                                     {"trigger": "analyze", "dem_mode": "auto"})
         execute_analysis_run(rid, extra_progress=progress)
         db.update_job(jid, "done", log_line="done")
     except (DemSourceError, ValueError) as exc:
@@ -166,12 +185,43 @@ def _run_job(jid: str, pid: str):
         db.update_job(jid, f"error:internal error: {exc}", log_line=str(exc))
 
 
+class AnalyzeIn(BaseModel):
+    dtm_id: str | None = None
+    dem_mode: str = "auto"
+
+
 @app.post("/api/projects/{pid}/analyze")
-def analyze(pid: str, background: BackgroundTasks):
-    _require_project(pid)
+def analyze(pid: str, background: BackgroundTasks,
+            body: AnalyzeIn | None = None):
+    """Run terrain analysis. With ``dtm_id`` the library DTM is resolved and
+    verified server-side before anything is queued; without a body the legacy
+    behavior (project drone_path, auto mode) is preserved."""
+    proj = _require_project(pid)
+    body = body or AnalyzeIn()
+
+    survey_id = None
+    if body.dtm_id:
+        from .dtm_api import resolve_dtm_for_analysis
+
+        dtm, dem_path = resolve_dtm_for_analysis(body.dtm_id)
+        survey_id = dtm.get("survey_id")
+        db.set_drone_path(pid, dem_path)  # keypoint-move + legacy reuse
+    else:
+        dem_path = proj.get("drone_path")
+        if dem_path and not os.path.isfile(dem_path):
+            dem_path = None  # stale pointer must not fail the satellite run
+        if body.dem_mode in ("drone_only", "fused") and not dem_path:
+            raise HTTPException(
+                422, f"dem_mode={body.dem_mode} requires a DTM — select or "
+                     "upload one first")
+
     jid = db.create_job(pid)
-    background.add_task(_run_job, jid, pid)
-    return {"job_id": jid}
+    rid = db.create_analysis_run(pid, survey_id, dem_path,
+                                 {"trigger": "analyze",
+                                  "dem_mode": body.dem_mode,
+                                  "dtm_id": body.dtm_id})
+    background.add_task(_run_job, jid, rid)
+    return {"job_id": jid, "run_id": rid}
 
 
 @app.get("/api/projects/{pid}/status")
@@ -234,6 +284,7 @@ def move_keypoint(pid: str, kid: str, body: MoveIn):
 
 class ReanalyzeIn(BaseModel):
     survey_id: str | None = None   # pick a specific survey's DTM
+    dtm_id: str | None = None      # pick a library DTM (preferred)
     dem_mode: str = "auto"
 
 
@@ -246,7 +297,12 @@ def reanalyze(pid: str, body: ReanalyzeIn):
 
     dem_path = None
     survey_id = body.survey_id
-    if survey_id:
+    if body.dtm_id:
+        from .dtm_api import resolve_dtm_for_analysis
+
+        dtm, dem_path = resolve_dtm_for_analysis(body.dtm_id)
+        survey_id = dtm.get("survey_id") or survey_id
+    elif survey_id:
         survey = db.get_survey(survey_id)
         if survey is None or survey["project_id"] != pid:
             raise HTTPException(404, "Survey not found in this project")
