@@ -45,15 +45,22 @@ _AUDITED = __import__("re").compile(
 
 @app.middleware("http")
 async def tenancy_middleware(request: Request, call_next):
-    """Actor resolution + org scoping + role checks + rate limiting + audit
-    trail + security headers. In AUTH_MODE=disabled everything acts as the
-    default organization's owner (backward compatible)."""
+    """Request correlation + actor resolution + org scoping + role checks +
+    rate limiting + audit trail + security headers. In AUTH_MODE=disabled
+    everything acts as the default organization's owner (backward
+    compatible)."""
+    import time as _time
+
     from starlette.responses import JSONResponse as _JSON
 
-    from . import auth
+    from . import auth, observability
 
+    request_id = request.headers.get("x-request-id") \
+        or observability.new_request_id()
+    request.state.request_id = request_id
     method = request.method
     path = request.url.path
+    started = _time.time()
     try:
         actor = await __import__("anyio").to_thread.run_sync(
             auth.check_request, method, path,
@@ -62,20 +69,63 @@ async def tenancy_middleware(request: Request, call_next):
                                      if request.client else "anon")
         auth.check_rate_limit(method, path, rate_key)
     except auth.TenancyError as exc:
-        return _JSON({"detail": exc.message}, status_code=exc.status)
+        return _JSON({"detail": exc.message, "request_id": request_id},
+                     status_code=exc.status,
+                     headers={"X-Request-ID": request_id})
+    except Exception:  # noqa: BLE001 — same error boundary as below
+        log.exception("unhandled error in request guard request_id=%s "
+                      "method=%s path=%s", request_id, method, path)
+        return _JSON({"detail": "Internal server error",
+                      "request_id": request_id}, status_code=500,
+                     headers={"X-Request-ID": request_id})
     request.state.actor = actor
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        # Central error boundary: full traceback for operators, an opaque
+        # correlation id for the client — internals never leak.
+        log.exception("unhandled error request_id=%s method=%s path=%s "
+                      "user=%s org=%s", request_id, method, path,
+                      actor.user_id, actor.org_id)
+        return _JSON({"detail": "Internal server error",
+                      "request_id": request_id}, status_code=500,
+                     headers={"X-Request-ID": request_id})
     if _AUDITED.search(path):
         try:
             db.audit(f"{method} {path}", user_id=actor.user_id,
                      org_id=actor.org_id,
-                     detail=f"status={response.status_code}")
+                     detail=f"status={response.status_code} "
+                            f"request_id={request_id}")
         except Exception:  # noqa: BLE001 — auditing must never break a request
             log.debug("audit write failed", exc_info=True)
+    if path.startswith("/api/") and not path.startswith("/api/health"):
+        log.info("request_id=%s method=%s path=%s status=%s duration_ms=%d "
+                 "org=%s", request_id, method, path, response.status_code,
+                 int((_time.time() - started) * 1000), actor.org_id)
+    response.headers.setdefault("X-Request-ID", request_id)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "same-origin")
     return response
+
+
+@app.get("/api/health")
+def api_health():
+    """Liveness: the process answers. Touches no dependency."""
+    from . import observability
+
+    return observability.health()
+
+
+@app.get("/api/ready")
+def api_ready():
+    """Readiness: database/queue/storage checks with operator detail.
+    503 only when a hard dependency for the configured mode is down."""
+    from . import observability
+
+    payload, status = observability.readiness()
+    return JSONResponse(payload, status_code=status,
+                        headers={"Cache-Control": "no-store"})
 
 
 # CORS is registered after the tenancy middleware so it wraps it (auth
