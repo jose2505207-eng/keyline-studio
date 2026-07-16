@@ -12,6 +12,27 @@ overrides the satellite data within its footprint.
 > Union and ESA.** Candidate keypoints are computational suggestions — field
 > verification is required before any earthworks.
 
+**Production foundation docs**:
+[audit](docs/production-readiness-audit.md) ·
+[architecture](docs/architecture.md) ·
+[analysis pipeline](docs/analysis-pipeline.md) ·
+[storage](docs/storage.md) ·
+[security & tenancy](docs/security.md) ·
+[deployment](docs/deployment.md) ·
+[disaster recovery](docs/disaster-recovery.md) ·
+[API](docs/api.md)
+
+Key production properties: every analysis is a persistent, versioned
+**analysis run** (stage plan, real progress, heartbeat, warnings, technical
+log) executed by an RQ worker (`ANALYSIS_EXECUTION=auto|rq|inline`);
+progress streams over **SSE** with polling fallback and survives browser
+refresh and process restarts; orphaned runs are swept to a retryable
+`WORKER_LOST` state; outputs are registered **artifacts** (sha256, size,
+MIME, raster metadata) behind verified download endpoints; optional
+**token auth + organization tenancy** (`AUTH_MODE=token`) isolates
+organizations end-to-end; `/api/health` + `/api/ready` report real
+dependency status.
+
 ## Architecture
 
 ```mermaid
@@ -258,13 +279,18 @@ Or with Docker: `docker compose up --build`, then open http://localhost:5173.
 ## Tests
 
 ```bash
-cd backend && .venv/bin/python -m pytest tests/
+cd backend && .venv/bin/python -m pytest tests/   # 210 tests, all offline
+cd frontend && npx tsc --noEmit && npx vitest run # 23 tests
 ```
 
-All tests are offline: GLO-30 tile-name math (all four hemisphere quadrants),
-drone/satellite fusion (offset removal + seam monotonicity), and an
-end-to-end synthetic-DEM run through valley extraction → keypoint detection →
-keyline generation, asserted against a known slope break.
+All backend tests are offline: GLO-30 tile-name math (all four hemisphere
+quadrants), drone/satellite fusion (offset removal + seam monotonicity),
+end-to-end synthetic-DEM runs through valley extraction → keypoint detection
+→ keyline generation, plus execution dispatch/retry/stale-run recovery
+(`test_analysis_execution.py`), SSE (`test_run_events.py`), artifact
+registration and verified downloads (`test_artifacts.py`),
+cross-organization isolation (`test_tenancy.py`), and health/readiness +
+error-boundary behavior (`test_observability.py`).
 
 ## How it works
 
@@ -338,15 +364,20 @@ SQLite (`backend/data/keyline.sqlite`). No Redis/Celery.
 
 ## API
 
+Full reference: [docs/api.md](docs/api.md) (or `GET /docs`). The essentials:
+
 | Endpoint | Purpose |
 |---|---|
-| `POST /api/projects` | `{name, aoi}` → `{project_id}` (accepts a Polygon geometry or Feature) |
-| `POST /api/projects/{id}/drone-dem` | multipart GeoTIFF upload (validated: single-band, has CRS) |
-| `POST /api/projects/{id}/analyze` | enqueue pipeline → `{job_id}` |
-| `GET /api/projects/{id}/status` | `{state, log}` |
-| `GET /api/projects/{id}/results` | result GeoJSON FeatureCollection |
-| `GET /api/projects/{id}/hillshade` | hillshade PNG (bounds in `X-Bounds` header) |
-| `GET /api/projects/{id}/hillshade-bounds` | WGS84 corner coordinates (JSON) |
+| `POST /api/projects` | `{name, aoi, ranch_id?}` → `{project_id}` |
+| `POST /api/projects/{id}/analyze` | create + dispatch an analysis run → `{run_id, executor}`; 409 + `active_run_id` if one is live |
+| `GET /api/projects/{id}/analysis-runs/{rid}` | canonical run state: stage plan, progress %, heartbeat health, warnings, log |
+| `GET /api/projects/{id}/analysis-runs/{rid}/events` | live progress as Server-Sent Events (polling stays the fallback) |
+| `POST /api/projects/{id}/analysis-runs/{rid}/retry` | retry a failed/stalled run as a new linked run |
+| `POST /api/projects/{id}/analysis-runs/{rid}/cancel` | cooperative cancel between stages |
+| `GET /api/projects/{id}/artifacts` | download center: registered outputs with size/sha256/verified availability |
+| `GET /api/projects/{id}/artifacts/{aid}/download` | verified file download (410 if the file vanished) |
+| `GET /api/dtms` · `POST /api/dtms/upload` · `POST /api/dtms/import-path` | managed DTM library (org-scoped, no raw paths) |
+| `GET /api/health` · `GET /api/ready` | liveness / dependency readiness |
 | `POST /api/projects/{id}/keypoints/{kid}/move` | `{lng, lat}` → recomputes that keypoint's keyline only |
 
 ## Decisions & deviations from the spec
@@ -512,8 +543,11 @@ Every variable ships with a safe development default — see
 provider (`PHOTOGRAMMETRY_PROVIDER`, `NODEODM_URL`, `NODEODM_TOKEN`, …), ODM
 task defaults (`ODM_*`), Redis (`REDIS_URL`), object storage (`STORAGE_BACKEND`,
 `S3_*` incl. `S3_PUBLIC_ENDPOINT_URL` for presigned browser URLs behind
-docker), upload limits (`DRONE_*`), and the drone-only coverage threshold
-(`DRONE_ONLY_MIN_AOI_COVERAGE`).
+docker), upload limits (`DRONE_*`), the drone-only coverage threshold
+(`DRONE_ONLY_MIN_AOI_COVERAGE`), analysis execution + recovery
+(`ANALYSIS_EXECUTION`, `ANALYSIS_WORKER_LOST_SECONDS`,
+`ANALYSIS_STAGE_TIMEOUT_SECONDS`, `ANALYSIS_RATE_LIMIT_PER_MINUTE`), and
+auth/tenancy (`AUTH_MODE`, `ADMIN_TOKEN`).
 
 ## Known limitations
 
