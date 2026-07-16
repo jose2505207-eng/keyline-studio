@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
+import time
+import zipfile
 
 from .kml_io import results_to_kml
 
@@ -132,3 +135,230 @@ def export_availability(fc: dict) -> dict:
         "gpkg": has_any,
         "unavailable_reason": None if has_keylines else _keyline_reason(fc),
     }
+
+
+# ---------------------------------------------------------------------------
+# Design products (original DTM, terrain layers, summary, ZIP package)
+
+
+def safe_filename(name: str, default: str = "keyline") -> str:
+    """A filesystem-safe base name (no path separators / traversal)."""
+    base = os.path.basename(name or "")
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip("-._")
+    return base or default
+
+
+def terrain_layers_geojson(fc: dict) -> dict:
+    """All terrain vectors (valleys, ridges, keypoints, contours) — the
+    context layers, separate from the keyline design."""
+    feats = _features(fc, {"valley", "ridge", "keypoint", "contour"})
+    props = fc.get("properties") or {}
+    return {
+        "type": "FeatureCollection",
+        "features": feats,
+        "properties": {
+            "layer": "terrain",
+            "project_id": props.get("project_id"),
+            "analysis_run_id": props.get("analysis_run_id"),
+            "counts": props.get("counts"),
+        },
+    }
+
+
+def analysis_summary(fc: dict, run: dict | None = None,
+                     project: dict | None = None) -> dict:
+    """Human/machine summary of the analysis run for the design package."""
+    props = fc.get("properties") or {}
+    return {
+        "project_id": props.get("project_id"),
+        "project_name": (project or {}).get("name"),
+        "analysis_run_id": props.get("analysis_run_id"),
+        "survey_id": props.get("survey_id"),
+        "analysis_version": (run or {}).get("analysis_version"),
+        "dem_mode": props.get("dem_mode"),
+        "terrain_source": (run or {}).get("terrain_source") or props.get("dem_mode"),
+        "dem_resolution_m": props.get("dem_resolution_m"),
+        "drone_coverage": props.get("drone_coverage"),
+        "analysis_crs": props.get("analysis_crs"),
+        "dem_bounds_wgs84": props.get("dem_bounds_wgs84"),
+        "relief_m": props.get("relief_m"),
+        "status": props.get("status"),
+        "counts": props.get("counts"),
+        "notices": props.get("notices"),
+        "keypoint_reasons": props.get("keypoint_reasons"),
+        "warning": props.get("warning"),
+        "generated_at": time.time(),
+    }
+
+
+def resolve_original_dtm(run: dict, out_dir: str) -> tuple[str, str] | None:
+    """(path, download_filename) of the untouched elevation raster used by the
+    analysis. For an existing/drone DTM this is the exact source file (bytes
+    unchanged); for a satellite-only run it is the reprojected analysis DEM,
+    which is the elevation raster the analysis actually used."""
+    dem_path = run.get("dem_path")
+    if dem_path and os.path.isfile(dem_path):
+        return dem_path, "original-dtm.tif"
+    fallback = os.path.join(out_dir, "dem_utm.tif")
+    if os.path.isfile(fallback):
+        return fallback, "original-dtm.tif"
+    return None
+
+
+def _readme_text(fc: dict, run: dict | None, project: dict | None) -> str:
+    props = fc.get("properties") or {}
+    counts = props.get("counts") or {}
+    name = (project or {}).get("name") or props.get("project_id") or "project"
+    lines = [
+        f"Keyline Studio — design package for {name}",
+        "=" * 60,
+        "",
+        "CANDIDATE DESIGN ONLY. These keylines and keypoints are computational",
+        "suggestions. Field verification by a qualified practitioner is",
+        "required before any earthworks.",
+        "",
+        f"Analysis run:      {props.get('analysis_run_id')}",
+        f"Analysis version:  {(run or {}).get('analysis_version')}",
+        f"Terrain source:    {props.get('dem_mode')}",
+        f"DEM resolution:    {props.get('dem_resolution_m')} m/px",
+        f"Analysis CRS:      {props.get('analysis_crs')}",
+        f"AOI bounds (WGS84):{props.get('dem_bounds_wgs84')}",
+        f"Terrain relief:    {props.get('relief_m')} m",
+        f"Status:            {props.get('status')}",
+        "",
+        "Feature counts:",
+        f"  Valleys:   {counts.get('valleys', 0)}",
+        f"  Ridges:    {counts.get('ridges', 0)}",
+        f"  Keypoints: {counts.get('keypoints', 0)}",
+        f"  Keylines:  {counts.get('keylines', 0)}",
+        f"  Contours:  {counts.get('contours', 0)}",
+        "",
+    ]
+    if not counts.get("keylines"):
+        lines += ["NO KEYLINE FOUND for this analysis.",
+                  _keyline_reason(fc), ""]
+    warn = props.get("warning")
+    if warn:
+        lines += ["QA / reliability warning:", f"  {warn}", ""]
+    lines += [
+        "Files:",
+        "  original-dtm.tif      Untouched elevation raster used for analysis.",
+        "  keyline-design-map.tif Visual georeferenced map (NOT elevation).",
+        "  keylines.geojson      Candidate keylines + keypoints (EPSG:4326).",
+        "  keylines.kml          Candidate keylines for Google Earth.",
+        "  terrain-layers.geojson Valleys, ridges, contours (context).",
+        "  analysis-summary.json Machine-readable run summary.",
+        "  terrain-qa.json       Terrain quality-assurance report.",
+        "  orthophoto.tif        Orthophoto (when available).",
+        "  manifest.json         Package contents + checksums.",
+        "",
+        "Elevation data may include Copernicus GLO-30 (c) DLR/Airbus, ESA/EU.",
+    ]
+    return "\n".join(lines)
+
+
+def build_design_package(zip_path: str, *, out_dir: str, fc: dict,
+                         run: dict | None = None, project: dict | None = None,
+                         original_dtm: tuple[str, str] | None = None,
+                         orthophoto_path: str | None = None) -> str:
+    """Assemble the complete design ZIP atomically.
+
+    All archive names are fixed literals under a sanitised project folder, so
+    the package can never contain a traversal path. Written to a temp file and
+    renamed into place; the caller streams the finished file.
+    """
+    props = fc.get("properties") or {}
+    folder = safe_filename(
+        (project or {}).get("name") or props.get("project_id") or "keyline",
+        "keyline-design")
+    manifest: dict = {"folder": folder, "files": [],
+                      "analysis_run_id": props.get("analysis_run_id"),
+                      "generated_at": time.time()}
+
+    def _arc(name: str) -> str:
+        return f"{folder}/{safe_filename(name)}"
+
+    os.makedirs(os.path.dirname(os.path.abspath(zip_path)), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(zip_path)),
+                               suffix=".zip.tmp")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            def write_bytes(name: str, data: bytes) -> None:
+                arc = _arc(name)
+                zf.writestr(arc, data)
+                manifest["files"].append({"name": arc, "bytes": len(data)})
+
+            def write_file(name: str, path: str) -> None:
+                if not path or not os.path.isfile(path):
+                    return
+                arc = _arc(name)
+                zf.write(path, arcname=arc)
+                manifest["files"].append(
+                    {"name": arc, "bytes": os.path.getsize(path)})
+
+            write_bytes("README.txt", _readme_text(fc, run, project).encode())
+            if original_dtm:
+                write_file("original-dtm.tif", original_dtm[0])
+            write_file("keyline-design-map.tif",
+                       os.path.join(out_dir, "keyline-design-map.tif"))
+            # keyline design (only when present)
+            try:
+                write_bytes("keylines.geojson",
+                            json.dumps(keylines_geojson(fc)).encode())
+                write_bytes("keylines.kml",
+                            keylines_kml(fc, f"Keylines — {folder}").encode())
+            except ExportUnavailable:
+                pass
+            write_bytes("terrain-layers.geojson",
+                        json.dumps(terrain_layers_geojson(fc)).encode())
+            write_bytes("analysis-summary.json",
+                        json.dumps(analysis_summary(fc, run, project),
+                                   indent=2).encode())
+            write_bytes("terrain-qa.json",
+                        json.dumps((run or {}).get("qa_json")
+                                   or props.get("qa") or {}, indent=2).encode())
+            if orthophoto_path:
+                write_file("orthophoto.tif", orthophoto_path)
+            write_bytes("manifest.json", json.dumps(manifest, indent=2).encode())
+        os.replace(tmp, zip_path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return zip_path
+
+
+def generate_run_exports(out_dir: str, fc: dict,
+                         aoi_wgs84: dict | None = None) -> dict:
+    """Produce the heavy standing export (visual GeoTIFF) for a completed run
+    and report availability. Lightweight text exports are generated on demand.
+
+    Never reruns hydrology; only reads the run's existing rasters/vectors. An
+    export failure is reported (not raised) so a completed terrain analysis is
+    never demoted to failed by an optional download.
+    """
+    counts = (fc.get("properties") or {}).get("counts") or {}
+    has_keylines = bool(counts.get("keylines"))
+    has_vectors = any(counts.get(k) for k in
+                      ("valleys", "ridges", "keypoints", "keylines", "contours"))
+    avail = {
+        "original_dtm": True,  # resolved at download time
+        "keylines_geojson": has_keylines,
+        "keylines_kml": has_keylines,
+        "terrain_layers_geojson": has_vectors,
+        "visual_geotiff": False,
+        "design_bundle": True,
+        "errors": {},
+    }
+    # Visual GeoTIFF: a diagnostic terrain map is still useful with no keyline,
+    # so build it whenever there is any raster to render.
+    dest = os.path.join(out_dir, "keyline-design-map.tif")
+    try:
+        from .visual_export import build_visual_geotiff
+
+        build_visual_geotiff(out_dir, dest, aoi_wgs84=aoi_wgs84)
+        avail["visual_geotiff"] = True
+        avail["visual_is_diagnostic"] = not has_keylines
+    except Exception as exc:  # noqa: BLE001 — optional export, report don't raise
+        avail["errors"]["visual_geotiff"] = str(exc)
+    return avail

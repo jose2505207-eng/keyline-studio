@@ -391,35 +391,296 @@ def reanalyze(pid: str, body: ReanalyzeIn):
             "dem_path": bool(dem_path), "survey_id": survey_id}
 
 
-def _run_out(run: dict) -> dict:
+def _rq_job_status(rq_job_id: str | None) -> str | None:
+    """RQ job status ('started'/'queued'/'finished'/'failed'/…) or 'missing'
+    when the job record is gone. None when there's no RQ job (inline run) or
+    the queue backend is unreachable."""
+    if not rq_job_id:
+        return None
+    try:
+        import redis
+        from rq.job import Job
+
+        from . import config as _cfg
+
+        conn = redis.Redis.from_url(_cfg.redis_url())
+        job = Job.fetch(rq_job_id, connection=conn)
+        return job.get_status(refresh=True)
+    except Exception as exc:  # noqa: BLE001
+        from rq.exceptions import NoSuchJobError
+
+        if isinstance(exc, NoSuchJobError):
+            return "missing"
+        return None
+
+
+def _run_output_dir(run: dict) -> str:
+    if run.get("result_dir"):
+        return run["result_dir"]
+    from .jobs.terrain_job import run_output_dir
+
+    return run_output_dir(run["project_id"], run["id"])
+
+
+def _run_downloads(run: dict) -> dict:
+    """Which download products this run can currently serve."""
+    from . import exports as exports_mod
+
+    out_dir = _run_output_dir(run)
+    counts = run.get("counts_json") or {}
+    has_keylines = bool(counts.get("keylines"))
+    terminal = run.get("state") in {"completed", "completed_with_warnings"}
+    original = exports_mod.resolve_original_dtm(run, out_dir) is not None
+    visual = os.path.isfile(os.path.join(out_dir, "keyline-design-map.tif"))
     return {
+        "original_dtm": bool(terminal and original),
+        "keylines_geojson": bool(terminal and has_keylines),
+        "keylines_kml": bool(terminal and has_keylines),
+        "visual_geotiff": bool(terminal and visual),
+        "design_bundle": bool(terminal),
+    }
+
+
+def _run_out(run: dict, *, full: bool = False) -> dict:
+    from . import progress as prog
+
+    now = __import__("time").time()
+    started = run.get("started_at") or run.get("created_at")
+    hb = run.get("heartbeat_at")
+    elapsed = int((run.get("completed_at") or now) - started) if started else None
+    since_hb = int(now - hb) if hb else None
+    worker_status = _rq_job_status(run.get("rq_job_id"))
+    health = prog.classify_health(run, worker_status=worker_status, now=now)
+    out = {
         "id": run["id"], "project_id": run["project_id"],
         "survey_id": run.get("survey_id"), "state": run["state"],
-        "stage": run.get("stage"), "dem_mode": run.get("dem_mode"),
-        "dem_path": os.path.basename(run["dem_path"]) if run.get("dem_path") else None,
+        "stage": run.get("stage"),
+        "stage_label": run.get("stage_label") or prog.stage_label(run.get("stage")),
+        "stage_index": run.get("stage_index") or 0,
+        "stage_count": run.get("stage_count") or 0,
+        "stage_plan": run.get("stage_plan_json") or [],
+        "progress_percent": run.get("progress_percent") or 0,
+        "current_message": run.get("current_message"),
+        "dem_mode": run.get("dem_mode"),
+        "terrain_source": run.get("terrain_source") or run.get("dem_mode"),
+        "analysis_version": run.get("analysis_version"),
+        "has_dem": bool(run.get("dem_path")),
         "params": run.get("params_json") or {},
         "counts": run.get("counts_json"),
+        "feature_counts": run.get("counts_json") or {
+            "valleys": 0, "ridges": 0, "keypoints": 0, "keylines": 0},
         "notices": run.get("notices_json") or [],
         "qa": run.get("qa_json"),
+        "warnings": run.get("warnings_json") or [],
+        "error_code": run.get("error_code"),
         "error_message": run.get("error_message"),
+        "started_at": run.get("started_at"),
+        "heartbeat_at": run.get("heartbeat_at"),
+        "updated_at": run.get("updated_at"),
         "created_at": run["created_at"],
         "completed_at": run.get("completed_at"),
+        "elapsed_seconds": elapsed,
+        "seconds_since_heartbeat": since_hb,
+        "health": health,
+        "health_message": prog.health_message(health, since_hb),
+        "cancellable": run.get("state") in ("queued", "running")
+        and not run.get("cancel_requested"),
+        "worker": {"rq_job_id": run.get("rq_job_id"),
+                   "status": worker_status,
+                   "worker_name": run.get("worker_name")},
+        "exports": _run_downloads(run),
     }
+    if full:
+        out["log"] = run.get("log_json") or []
+    return out
+
+
+def _no_store(payload: dict) -> JSONResponse:
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/projects/{pid}/analysis-runs")
 def list_analysis_runs(pid: str):
     _require_project(pid)
-    return {"runs": [_run_out(r) for r in db.list_analysis_runs(pid)]}
+    return _no_store({"runs": [_run_out(r) for r in db.list_analysis_runs(pid)]})
 
 
-@app.get("/api/projects/{pid}/analysis-runs/{rid}")
-def get_analysis_run(pid: str, rid: str):
+def _require_run(pid: str, rid: str) -> dict:
     _require_project(pid)
     run = db.get_analysis_run(rid)
     if run is None or run["project_id"] != pid:
         raise HTTPException(404, "Analysis run not found in this project")
-    return _run_out(run)
+    return run
+
+
+@app.get("/api/projects/{pid}/analysis-runs/{rid}")
+def get_analysis_run(pid: str, rid: str):
+    run = _require_run(pid, rid)
+    return _no_store(_run_out(run, full=True))
+
+
+@app.post("/api/projects/{pid}/analysis-runs/{rid}/cancel")
+def cancel_analysis_run(pid: str, rid: str):
+    run = _require_run(pid, rid)
+    if not db.request_run_cancel(rid):
+        raise HTTPException(409, "Run is already in a terminal state")
+    # best-effort: also cancel the RQ job so a queued job never starts
+    if run.get("rq_job_id"):
+        try:
+            import redis
+            from rq.job import Job
+
+            from . import config as _cfg
+
+            conn = redis.Redis.from_url(_cfg.redis_url())
+            Job.fetch(run["rq_job_id"], connection=conn).cancel()
+        except Exception:  # noqa: BLE001 — cooperative flag is the real signal
+            pass
+    return _no_store({"ok": True, "state": "cancelling"})
+
+
+@app.post("/api/projects/{pid}/analysis-runs/{rid}/regenerate-exports")
+def regenerate_exports(pid: str, rid: str):
+    """Rebuild the standing exports (visual GeoTIFF) for a completed run
+    without rerunning terrain analysis/hydrology."""
+    run = _require_run(pid, rid)
+    if run.get("state") not in ("completed", "completed_with_warnings"):
+        raise HTTPException(409, "Run has no completed results to export")
+    out_dir = _run_output_dir(run)
+    results = os.path.join(out_dir, "results.geojson")
+    if not os.path.isfile(results):
+        raise HTTPException(404, "Run results are unavailable")
+    with open(results) as f:
+        fc = json.load(f)
+    from . import exports as exports_mod
+
+    proj = db.get_project(pid)
+    avail = exports_mod.generate_run_exports(
+        out_dir, fc, aoi_wgs84=proj["aoi"] if proj else None)
+    db.update_analysis_run(rid, exports_json=avail)
+    return _no_store({"ok": True, "exports": _run_downloads(
+        db.get_analysis_run(rid))})
+
+
+# ---------------------------------------------------------------------------
+# Run-scoped download products (original DTM, keylines, visual map, ZIP)
+
+
+def _run_results_fc(run: dict) -> dict:
+    path = os.path.join(_run_output_dir(run), "results.geojson")
+    if not os.path.isfile(path):
+        raise HTTPException(404, "No results for this analysis run")
+    with open(path) as f:
+        return json.load(f)
+
+
+@app.get("/api/projects/{pid}/analysis-runs/{rid}/exports")
+def run_exports_availability(pid: str, rid: str):
+    run = _require_run(pid, rid)
+    return _no_store(_run_downloads(run))
+
+
+@app.get("/api/projects/{pid}/analysis-runs/{rid}/downloads/dtm")
+def download_run_dtm(pid: str, rid: str):
+    from . import exports as exports_mod
+
+    run = _require_run(pid, rid)
+    resolved = exports_mod.resolve_original_dtm(run, _run_output_dir(run))
+    if resolved is None:
+        raise HTTPException(404, "Original DTM is not available for this run")
+    path, _ = resolved
+    return FileResponse(
+        path, media_type="image/tiff",
+        headers={"Content-Disposition":
+                 f'attachment; filename="keyline-{rid}-original-dtm.tif"'})
+
+
+@app.get("/api/projects/{pid}/analysis-runs/{rid}/downloads/keylines.geojson")
+def download_run_keylines_geojson(pid: str, rid: str):
+    from .exports import ExportUnavailable, keylines_geojson
+
+    run = _require_run(pid, rid)
+    try:
+        sub = keylines_geojson(_run_results_fc(run))
+    except ExportUnavailable as exc:
+        raise HTTPException(409, str(exc))
+    return JSONResponse(sub, media_type="application/geo+json", headers={
+        "Content-Disposition":
+            f'attachment; filename="keyline-{rid}-keylines.geojson"',
+        "Cache-Control": "no-store"})
+
+
+@app.get("/api/projects/{pid}/analysis-runs/{rid}/downloads/keylines.kml")
+def download_run_keylines_kml(pid: str, rid: str):
+    from fastapi.responses import Response
+
+    from .exports import ExportUnavailable, keylines_kml
+
+    run = _require_run(pid, rid)
+    proj = db.get_project(pid)
+    try:
+        kml_text = keylines_kml(_run_results_fc(run),
+                                f"Keylines — {proj['name'] if proj else pid}")
+    except ExportUnavailable as exc:
+        raise HTTPException(409, str(exc))
+    return Response(content=kml_text,
+                    media_type="application/vnd.google-earth.kml+xml",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="keyline-{rid}-keylines.kml"'})
+
+
+@app.get("/api/projects/{pid}/analysis-runs/{rid}/downloads/keyline-design-map.tif")
+def download_run_visual_map(pid: str, rid: str):
+    run = _require_run(pid, rid)
+    out_dir = _run_output_dir(run)
+    path = os.path.join(out_dir, "keyline-design-map.tif")
+    if not os.path.isfile(path):
+        # regenerate on demand (no hydrology rerun) if results still exist
+        from . import exports as exports_mod
+
+        proj = db.get_project(pid)
+        try:
+            exports_mod.generate_run_exports(
+                out_dir, _run_results_fc(run),
+                aoi_wgs84=proj["aoi"] if proj else None)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(422, f"Could not build visual map: {exc}")
+        if not os.path.isfile(path):
+            raise HTTPException(404, "Visual map is not available for this run")
+    return FileResponse(
+        path, media_type="image/tiff",
+        headers={"Content-Disposition":
+                 f'attachment; filename="keyline-{rid}-design-map.tif"'})
+
+
+@app.get("/api/projects/{pid}/analysis-runs/{rid}/downloads/design-package.zip")
+def download_run_design_package(pid: str, rid: str):
+    from . import exports as exports_mod
+
+    run = _require_run(pid, rid)
+    proj = db.get_project(pid)
+    out_dir = _run_output_dir(run)
+    fc = _run_results_fc(run)
+    # ensure the visual map is present so the package is complete
+    if not os.path.isfile(os.path.join(out_dir, "keyline-design-map.tif")):
+        try:
+            exports_mod.generate_run_exports(
+                out_dir, fc, aoi_wgs84=proj["aoi"] if proj else None)
+        except Exception:  # noqa: BLE001 — package still assembles without it
+            pass
+    ortho = os.path.join(project_dir(pid), "photogrammetry", "orthophoto.tif")
+    zip_path = os.path.join(out_dir, "exports", "design-package.zip")
+    try:
+        exports_mod.build_design_package(
+            zip_path, out_dir=out_dir, fc=fc, run=run, project=proj,
+            original_dtm=exports_mod.resolve_original_dtm(run, out_dir),
+            orthophoto_path=ortho if os.path.isfile(ortho) else None)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(422, f"Could not build design package: {exc}")
+    return FileResponse(
+        zip_path, media_type="application/zip",
+        headers={"Content-Disposition":
+                 f'attachment; filename="keyline-{rid}-design-package.zip"'})
 
 
 # ---------------------------------------------------------------------------

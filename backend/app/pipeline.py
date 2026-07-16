@@ -117,27 +117,39 @@ def run_terrain_analysis(
     params: Params = Params(),
     progress: Callable[[str], None] = lambda s: None,
     drone_weight: np.ndarray | None = None,
+    reporter=None,
 ) -> TerrainResult:
     """Spec steps 4-9: conditioning -> flow -> valleys/ridges -> keypoints -> keylines."""
+    from . import progress as prog
+
+    def stage(name: str, msg: str) -> None:
+        if reporter is not None:
+            reporter.start_stage(name, msg)
+        else:
+            progress(msg)
+
     engine = get_engine()
     cell = abs(transform.a)
     res = TerrainResult()
     # Physically meaningful stream threshold: contributing area in m² -> cells.
     threshold_cells = max(params.min_drainage_area_m2 / (cell * cell), 2.0)
 
-    progress(f"hydrological conditioning + flow routing ({engine.name})")
+    stage(prog.CONDITIONING_DEM,
+          f"hydrological conditioning + flow routing ({engine.name})")
     conditioned, facc = engine.flow_accumulation(dem, transform)
     res.conditioned_dem = conditioned
     res.flow_accumulation = facc
 
-    progress("extracting valleys")
+    stage(prog.CALCULATING_FLOW_ACCUMULATION,
+          "computing flow accumulation + extracting valleys")
+    stage(prog.EXTRACTING_VALLEYS, "extracting valleys")
     res.valleys = terrain.extract_stream_lines(
         facc, conditioned, transform,
         threshold_cells=threshold_cells,
         min_length_m=params.min_line_length_m,
     )
 
-    progress("extracting ridges")
+    stage(prog.EXTRACTING_RIDGES, "extracting ridges")
     conditioned_inv, facc_inv = engine.flow_accumulation(
         np.where(np.isnan(dem), np.nan, -dem), transform
     )
@@ -158,7 +170,7 @@ def run_terrain_analysis(
         return (0 <= r < drone_weight.shape[0] and 0 <= c < drone_weight.shape[1]
                 and drone_weight[r, c] > 0.5)
 
-    progress("detecting keypoints")
+    stage(prog.DETECTING_KEYPOINTS, "detecting keypoints")
     for vi, valley in enumerate(res.valleys):
         if valley.length < params.min_valley_length_m:
             continue
@@ -183,7 +195,7 @@ def run_terrain_analysis(
             "valley_idx": vi,
         })
 
-    progress("generating keylines")
+    stage(prog.GENERATING_KEYLINES, "generating keylines")
     for ki, kp in enumerate(res.keypoints):
         line = terrain.contour_at(dem, transform, kp["elevation"], kp["point"])
         if line is not None:
@@ -209,7 +221,8 @@ def _write_outputs(out_dir: str, dem_da: xr.DataArray, result: TerrainResult,
                    ctx, drone_weight: np.ndarray | None,
                    extra_properties: dict | None = None,
                    notices: list[str] | None = None,
-                   contour_interval_m: float = 0.0):
+                   contour_interval_m: float = 0.0,
+                   reporter=None):
     """Clip vectors to the AOI, validate them, reproject to WGS84 exactly
     once, gate them against the run's spatial context, and write atomically.
 
@@ -438,6 +451,10 @@ def _write_outputs(out_dir: str, dem_da: xr.DataArray, result: TerrainResult,
     fc["properties"] = props  # foreign member (RFC 7946 §6.1)
 
     # ---- spatial-integrity gate: never export impossible geography ---------
+    if reporter is not None:
+        from . import progress as _prog
+        reporter.start_stage(_prog.VALIDATING_SPATIAL_RESULTS,
+                             "validating spatial integrity of results")
     spatial.validate_fc_bounds(fc, ctx,
                                buffer_m=_config.result_bounds_buffer_m())
 
@@ -445,6 +462,9 @@ def _write_outputs(out_dir: str, dem_da: xr.DataArray, result: TerrainResult,
     spatial.atomic_write_json(os.path.join(out_dir, "results.geojson"), fc)
 
     # Hillshade PNG + bounds sidecar (WGS84 corner coords for MapLibre overlay)
+    if reporter is not None:
+        from . import progress as _prog
+        reporter.start_stage(_prog.GENERATING_HILLSHADE, "generating hillshade")
     hs = terrain.hillshade(dem, cell)
     alpha = np.where(np.isnan(dem), 0, 255).astype(np.uint8)
     buf = io.BytesIO()
@@ -533,15 +553,28 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
                  survey_id: str | None = None,
                  analysis_run_id: str | None = None,
                  gcp_supplied: bool = False,
-                 satellite_qa: bool = False) -> dict:
+                 satellite_qa: bool = False,
+                 reporter=None) -> dict:
     """Full pipeline for a project. Returns the result FeatureCollection.
 
     ``out_dir`` (defaults to ``project_dir`` for backward compatibility)
     receives the run's outputs; callers doing versioned analysis runs pass a
-    per-run directory so no two runs can overwrite each other."""
+    per-run directory so no two runs can overwrite each other.
+
+    ``reporter`` (a :class:`app.progress.ProgressReporter`) drives structured
+    stage transitions when present; otherwise the plain ``progress`` string
+    callback is used (the synthetic tests rely on the latter)."""
+    from . import progress as prog
+
     out_dir = out_dir or project_dir
     project_id = os.path.basename(os.path.normpath(project_dir))
     aoi = shape(aoi_geojson)
+
+    def stage(name: str, msg: str) -> None:
+        if reporter is not None:
+            reporter.start_stage(name, msg)
+        else:
+            progress(msg)
 
     # --- guards
     utm_crs, aoi_utm = _utm_grid_for_aoi(aoi)
@@ -551,11 +584,18 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
             f"AOI is {area_km2:.1f} km² — the limit is {MAX_AOI_KM2:.0f} km². "
             "Draw a smaller area.")
 
+    if drone_path:
+        stage(prog.COMPUTING_DRONE_COVERAGE, "computing drone DTM coverage")
+    else:
+        stage(prog.SELECTING_DEM_MODE, "selecting DEM mode")
     dem_mode, drone_coverage = select_dem_mode(drone_path, aoi_geojson, dem_mode)
+    if reporter is not None:
+        reporter.set_mode(dem_mode, terrain_source=dem_mode)
 
     from rasterio.enums import Resampling
 
     if dem_mode == "drone_only":
+        stage(prog.PREPARING_DRONE_DEM, "preparing drone DTM (drone-only mode)")
         dem_da = _prepare_drone_only_grid(drone_path, aoi, utm_crs, progress)
         dem = dem_da.values.astype("float32")
         if np.isnan(dem).all():
@@ -570,23 +610,26 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
             clip_values = aoi_clip.values
         except Exception:
             clip_values = dem
+        stage(prog.TERRAIN_QUALITY_CHECKS,
+              "checking terrain relief and DTM quality")
         quality = assess_terrain_quality(
             np.asarray(clip_values, dtype="float32"), has_drone=True,
             params=params)
     else:
         # --- fetch (padded bbox)
-        progress("fetching Copernicus GLO-30 elevation")
+        stage(prog.FETCHING_SATELLITE_DEM, "fetching Copernicus GLO-30 elevation")
         w, s, e, n = aoi.bounds
         pw, ph = (e - w) * BBOX_PAD_FRAC, (n - s) * BBOX_PAD_FRAC
         sat = dem_source.fetch_glo30(w - pw, s - ph, e + pw, n + ph)
 
         # --- reproject to local UTM
-        progress(f"reprojecting to {utm_crs}")
+        stage(prog.REPROJECTING_SATELLITE_DEM, f"reprojecting to {utm_crs}")
         sat_utm = sat.rio.reproject(utm_crs, resampling=Resampling.bilinear)
         sat_utm = sat_utm.where(np.abs(sat_utm) < 1e10)
 
         # --- honest data-quality guard, on the raw (unsmoothed) satellite DEM
-        progress("checking terrain relief vs satellite vertical error")
+        stage(prog.TERRAIN_QUALITY_CHECKS,
+              "checking terrain relief vs satellite vertical error")
         try:
             aoi_clip = sat_utm.rio.clip([aoi_utm.__geo_interface__],
                                         all_touched=True)
@@ -607,7 +650,7 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
         drone_weight = None
         dem_da = sat_utm
         if dem_mode == "fused":
-            progress("fusing drone DEM")
+            stage(prog.FUSING_DEM, "fusing drone DEM with satellite base")
             drone = rioxarray.open_rasterio(drone_path, masked=True).squeeze("band", drop=True)
             drone_utm = drone.rio.reproject(utm_crs, resampling=Resampling.bilinear)
             drone_res = abs(drone_utm.rio.transform().a)
@@ -659,12 +702,18 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
     from . import config as _config
     from . import terrain_quality
 
+    def note(msg: str) -> None:
+        if reporter is not None:
+            reporter.heartbeat(msg)
+        else:
+            progress(msg)
+
     notices: list[str] = []
     qa_dict = None
     watermark = None
     qa_blocks_keylines = False
     if dem_mode in ("drone_only", "fused") and drone_path:
-        progress("running DTM quality assurance")
+        note("running DTM quality assurance")
         sat_fn = (terrain_quality.satellite_surface_for(drone_path)
                   if satellite_qa else None)
         qa = terrain_quality.assess_dtm(
@@ -675,27 +724,36 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
             if qa.mode == "strict":
                 qa_blocks_keylines = True
                 notices.append("KEYLINE_GENERATION_BLOCKED")
-                progress("severe terrain-quality issues — keyline generation "
-                         "blocked (strict mode)")
+                if reporter is not None:
+                    reporter.warning(
+                        "TERRAIN_QA_SEVERE", "severe terrain-quality issues — "
+                        "keyline generation blocked (strict mode)")
+                note("severe terrain-quality issues — keyline generation "
+                     "blocked (strict mode)")
             else:
                 watermark = terrain_quality.WATERMARK
-                progress("severe terrain-quality issues — result will be "
-                         "watermarked as diagnostic")
+                if reporter is not None:
+                    reporter.warning(
+                        "TERRAIN_QA_SEVERE", "severe terrain-quality issues — "
+                        "result will be watermarked as diagnostic")
+                note("severe terrain-quality issues — result will be "
+                     "watermarked as diagnostic")
 
     # --- terrain analysis (steps 4-9); suppressed entirely when the terrain
     # signal is below the satellite noise floor (hillshade still produced)
     if quality["suppress"]:
-        progress("relief below reliability floor — skipping vector analysis")
+        note("relief below reliability floor — skipping vector analysis")
         result = TerrainResult()
     else:
         result = run_terrain_analysis(dem, dem_da.rio.transform(), params,
-                                      progress, drone_weight=drone_weight)
+                                      progress, drone_weight=drone_weight,
+                                      reporter=reporter)
     if qa_blocks_keylines:
         result.keypoints = []
         result.keylines = []
 
     # --- persist DEM for keypoint-move recomputation, then outputs
-    progress("writing outputs")
+    note("writing derived rasters")
     os.makedirs(out_dir, exist_ok=True)
     dem_da.rio.write_nodata(np.nan, inplace=True)
     dem_da.rio.to_raster(os.path.join(out_dir, "dem_utm.tif"))
@@ -722,6 +780,7 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
              "dem_crs=%s bounds_wgs84=%s", analysis_run_id, project_id,
              dem_mode, utm_crs, dem_crs, ctx.dem_bounds_wgs84)
     fc = _write_outputs(out_dir, dem_da, result, ctx, drone_weight,
+                        reporter=reporter,
                         contour_interval_m=params.contour_interval_m,
                         extra_properties={
                             "warning": quality["warning"],

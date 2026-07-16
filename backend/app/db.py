@@ -186,7 +186,9 @@ def surveys_in_states(states: list[str]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Analysis runs (terrain analysis is versioned; photogrammetry is not rerun)
 
-_RUN_JSON_FIELDS = {"params_json", "qa_json", "counts_json", "notices_json"}
+_RUN_JSON_FIELDS = {"params_json", "qa_json", "counts_json", "notices_json",
+                    "log_json", "warnings_json", "exports_json",
+                    "stage_plan_json"}
 
 
 def _run_row_to_dict(row) -> dict:
@@ -250,6 +252,49 @@ def update_analysis_run(rid: str, **fields) -> None:
     vals.append(rid)
     with _conn() as c:
         c.execute(f"UPDATE analysis_runs SET {', '.join(cols)} WHERE id=?", vals)
+
+
+def append_run_log(rid: str, message: str, *, level: str = "info",
+                   stage: str | None = None, cap: int = 400) -> None:
+    """Append one technical-log entry to an analysis run (bounded ring)."""
+    with _conn() as c:
+        row = c.execute("SELECT log_json FROM analysis_runs WHERE id=?",
+                        (rid,)).fetchone()
+        if row is None:
+            return
+        try:
+            log = json.loads(row["log_json"]) if row["log_json"] else []
+        except (TypeError, json.JSONDecodeError):
+            log = []
+        log.append({"t": time.time(), "level": level, "stage": stage,
+                    "msg": message})
+        if len(log) > cap:
+            log = log[-cap:]
+        c.execute("UPDATE analysis_runs SET log_json=?, updated_at=? WHERE id=?",
+                  (json.dumps(log), time.time(), rid))
+
+
+def request_run_cancel(rid: str) -> bool:
+    """Flag a run for cooperative cancellation. Returns False if the run is
+    already in a terminal state (nothing to cancel)."""
+    with _conn() as c:
+        row = c.execute("SELECT state FROM analysis_runs WHERE id=?",
+                        (rid,)).fetchone()
+        if row is None:
+            return False
+        if row["state"] in ("completed", "completed_with_warnings", "failed",
+                            "cancelled"):
+            return False
+        c.execute("UPDATE analysis_runs SET cancel_requested=1, updated_at=? "
+                  "WHERE id=?", (time.time(), rid))
+    return True
+
+
+def run_cancel_requested(rid: str) -> bool:
+    with _conn() as c:
+        row = c.execute("SELECT cancel_requested FROM analysis_runs WHERE id=?",
+                        (rid,)).fetchone()
+    return bool(row and row["cancel_requested"])
 
 
 # ---------------------------------------------------------------------------

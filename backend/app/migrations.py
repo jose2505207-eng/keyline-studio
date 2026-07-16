@@ -9,8 +9,43 @@ every startup and from multiple processes (WAL + IMMEDIATE transaction).
 from __future__ import annotations
 
 import sqlite3
+from typing import Callable, Union
 
-MIGRATIONS: list[tuple[int, str]] = [
+
+def _add_analysis_progress_columns(conn: sqlite3.Connection) -> None:
+    """Migration 4: structured, persisted analysis-run progress.
+
+    Additive and idempotent — each column is added only if missing, so a
+    database left half-migrated by an interrupted upgrade converges cleanly.
+    No existing analysis run is dropped or rewritten.
+    """
+    existing = {row[1] for row in
+                conn.execute("PRAGMA table_info(analysis_runs)").fetchall()}
+    columns = [
+        ("stage_label", "TEXT"),
+        ("stage_index", "INTEGER NOT NULL DEFAULT 0"),
+        ("stage_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("stage_plan_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("progress_percent", "REAL NOT NULL DEFAULT 0"),
+        ("current_message", "TEXT"),
+        ("heartbeat_at", "REAL"),
+        ("started_at", "REAL"),
+        ("error_code", "TEXT"),
+        ("rq_job_id", "TEXT"),
+        ("worker_name", "TEXT"),
+        ("terrain_source", "TEXT"),
+        ("analysis_version", "TEXT"),
+        ("cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
+        ("log_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("warnings_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("exports_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ]
+    for name, decl in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE analysis_runs ADD COLUMN {name} {decl}")
+
+
+MIGRATIONS: list[tuple[int, Union[str, Callable[[sqlite3.Connection], None]]]] = [
     (
         1,
         """
@@ -95,6 +130,7 @@ MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_dtms_survey ON dtms(survey_id);
         """,
     ),
+    (4, _add_analysis_progress_columns),
 ]
 
 
@@ -106,10 +142,13 @@ def migrate(conn: sqlite3.Connection) -> int:
     )
     row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
     current = row[0] or 0
-    for version, sql in MIGRATIONS:
+    for version, step in MIGRATIONS:
         if version <= current:
             continue
-        conn.executescript(sql)
+        if callable(step):
+            step(conn)
+        else:
+            conn.executescript(step)
         conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
         current = version
     conn.commit()

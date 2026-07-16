@@ -495,38 +495,145 @@ export interface ResultsProperties {
   watermark?: string | null;
 }
 
+export interface RunExports {
+  original_dtm: boolean;
+  keylines_geojson: boolean;
+  keylines_kml: boolean;
+  visual_geotiff: boolean;
+  design_bundle: boolean;
+}
+
+export interface RunWarning {
+  code: string;
+  message: string;
+  t?: number;
+}
+
+export interface RunLogEntry {
+  t: number;
+  level?: string;
+  stage?: string | null;
+  msg: string;
+}
+
+/** Canonical analysis-run status — the single source of truth for the
+ * progress monitor. */
 export interface AnalysisRun {
   id: string;
   project_id: string;
   survey_id: string | null;
-  state: string;
+  state: string; // queued|running|completed|completed_with_warnings|failed|cancelled
   stage: string | null;
+  stage_label: string;
+  stage_index: number;
+  stage_count: number;
+  stage_plan: string[];
+  progress_percent: number;
+  current_message: string | null;
   dem_mode: string | null;
-  dem_path: string | null;
+  terrain_source: string | null;
+  analysis_version: string | null;
+  has_dem: boolean;
   params: Record<string, unknown>;
   counts: ResultCounts | null;
+  feature_counts: ResultCounts;
   notices: string[];
   qa: QAReport | null;
+  warnings: RunWarning[];
+  error_code: string | null;
   error_message: string | null;
+  started_at: number | null;
+  heartbeat_at: number | null;
+  updated_at: number | null;
   created_at: number;
   completed_at: number | null;
+  elapsed_seconds: number | null;
+  seconds_since_heartbeat: number | null;
+  health: string; // active|slow|possibly_stalled|worker_missing|failed|complete
+  health_message: string | null;
+  cancellable: boolean;
+  worker: { rq_job_id: string | null; status: string | null; worker_name: string | null };
+  exports: RunExports;
+  log?: RunLogEntry[];
+}
+
+export const STAGE_LABELS: Record<string, string> = {
+  queued: "Queued",
+  loading_project: "Loading project",
+  resolving_dtm: "Resolving DTM",
+  validating_dtm: "Validating DTM",
+  terrain_quality_checks: "Running terrain quality checks",
+  selecting_dem_mode: "Selecting DEM mode",
+  fetching_satellite_dem: "Fetching satellite DEM",
+  reprojecting_satellite_dem: "Reprojecting satellite DEM",
+  preparing_drone_dem: "Preparing drone DEM",
+  computing_drone_coverage: "Computing drone coverage",
+  fusing_dem: "Fusing DEM",
+  clipping_dem: "Clipping DEM to AOI",
+  conditioning_dem: "Conditioning terrain",
+  calculating_flow_direction: "Calculating flow direction",
+  calculating_flow_accumulation: "Calculating flow accumulation",
+  extracting_valleys: "Extracting valleys",
+  extracting_ridges: "Extracting ridges",
+  detecting_keypoints: "Detecting keypoints",
+  generating_keylines: "Generating keylines",
+  validating_spatial_results: "Validating spatial results",
+  generating_hillshade: "Generating hillshade",
+  generating_exports: "Creating downloads",
+  saving_results: "Saving results",
+  completed: "Complete",
+};
+
+export const TERRAIN_SOURCE_LABELS: Record<string, string> = {
+  satellite_only: "Satellite",
+  drone_only: "Drone DTM",
+  fused: "Fused (drone + satellite)",
+  existing_dtm: "Existing DTM",
+  auto: "Auto",
+};
+
+export function stageLabel(stage: string | null | undefined): string {
+  if (!stage) return "";
+  return STAGE_LABELS[stage] ?? stage.replace(/_/g, " ");
 }
 
 export async function reanalyze(
   projectId: string,
-  surveyId: string | null = null
+  opts: { surveyId?: string | null; dtmId?: string | null; demMode?: string } = {}
 ): Promise<{ run_id: string; state: string }> {
   const res = await fetch(url(`/api/projects/${projectId}/reanalyze`), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ survey_id: surveyId }),
+    body: JSON.stringify({
+      survey_id: opts.surveyId ?? null,
+      dtm_id: opts.dtmId ?? null,
+      dem_mode: opts.demMode ?? "auto",
+    }),
+  });
+  return jsonOrThrow(res);
+}
+
+/** Start analysis and return the created run id (the canonical handle the
+ * progress monitor polls). */
+export async function startAnalysisRun(
+  projectId: string,
+  options: { dtmId?: string; demMode?: string; terrain?: Record<string, number> } = {}
+): Promise<{ job_id: string; run_id: string }> {
+  const res = await fetch(url(`/api/projects/${projectId}/analyze`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      dtm_id: options.dtmId ?? null,
+      dem_mode: options.demMode ?? "auto",
+      terrain: options.terrain ?? null,
+    }),
   });
   return jsonOrThrow(res);
 }
 
 export async function getAnalysisRuns(projectId: string): Promise<AnalysisRun[]> {
   const body = await jsonOrThrow(
-    await fetch(url(`/api/projects/${projectId}/analysis-runs`))
+    await fetch(url(`/api/projects/${projectId}/analysis-runs`), { cache: "no-store" })
   );
   return body.runs;
 }
@@ -536,7 +643,49 @@ export async function getAnalysisRun(
   runId: string
 ): Promise<AnalysisRun> {
   return jsonOrThrow(
-    await fetch(url(`/api/projects/${projectId}/analysis-runs/${runId}`))
+    await fetch(url(`/api/projects/${projectId}/analysis-runs/${runId}`), {
+      cache: "no-store",
+    })
+  );
+}
+
+export async function cancelAnalysisRun(
+  projectId: string,
+  runId: string
+): Promise<void> {
+  await jsonOrThrow(
+    await fetch(url(`/api/projects/${projectId}/analysis-runs/${runId}/cancel`), {
+      method: "POST",
+    })
+  );
+}
+
+export async function regenerateExports(
+  projectId: string,
+  runId: string
+): Promise<{ ok: boolean; exports: RunExports }> {
+  return jsonOrThrow(
+    await fetch(
+      url(`/api/projects/${projectId}/analysis-runs/${runId}/regenerate-exports`),
+      { method: "POST" }
+    )
+  );
+}
+
+/** Absolute backend URL for a run download product (works Vercel -> Render:
+ * always resolved through the configured API base, never a hardcoded host). */
+export function runDownloadUrl(
+  projectId: string,
+  runId: string,
+  product:
+    | "dtm"
+    | "keylines.geojson"
+    | "keylines.kml"
+    | "keyline-design-map.tif"
+    | "design-package.zip"
+): string {
+  return url(
+    `/api/projects/${projectId}/analysis-runs/${runId}/downloads/${product}`
   );
 }
 

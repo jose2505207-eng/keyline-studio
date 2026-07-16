@@ -3,6 +3,7 @@ import maplibregl from "maplibre-gl";
 import { TerraDraw, TerraDrawPolygonMode } from "terra-draw";
 import { TerraDrawMapLibreGLAdapter } from "terra-draw-maplibre-gl-adapter";
 import * as api from "./api";
+import AnalysisProgressPanel from "./AnalysisProgressPanel";
 import DroneSurveyPanel from "./DroneSurveyPanel";
 import DtmPanel from "./DtmPanel";
 import GeorefModal from "./GeorefModal";
@@ -10,11 +11,30 @@ import { resolveProject } from "./projectFlow";
 
 const STORAGE_KEY = "keyline.active";
 
+const TERMINAL_RUN_STATES = [
+  "completed",
+  "completed_with_warnings",
+  "failed",
+  "cancelled",
+];
+// Stages whose underlying tool can legitimately run for minutes with no new
+// sub-step; poll these less aggressively.
+const SLOW_STAGES = [
+  "fetching_satellite_dem",
+  "reprojecting_satellite_dem",
+  "preparing_drone_dem",
+  "fusing_dem",
+  "conditioning_dem",
+  "calculating_flow_accumulation",
+  "generating_exports",
+];
+
 interface PersistedSession {
   projectId: string | null;
   surveyId: string | null;
   aoi: GeoJSON.Polygon | null;
   dtmId?: string | null;
+  runId?: string | null;
 }
 
 function loadSession(): PersistedSession {
@@ -112,6 +132,10 @@ export default function App() {
   const [runs, setRuns] = useState<api.AnalysisRun[]>([]);
   const [rerunning, setRerunning] = useState(false);
   const rerunTimer = useRef<number | null>(null);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [activeRun, setActiveRun] = useState<api.AnalysisRun | null>(null);
+  const activeRunIdRef = useRef<string | null>(null);
+  activeRunIdRef.current = activeRunId;
   const [exportOpen, setExportOpen] = useState(false);
   const [mapMeta, setMapMeta] = useState<api.MapMeta | null>(null);
   const [scanOverlay, setScanOverlay] = useState<{
@@ -274,6 +298,8 @@ export default function App() {
       setTerrainSource("dtm");
     }
     aoiRef.current = session.aoi;
+    // resume the live progress monitor after a browser refresh
+    if (session.runId) setActiveRunId(session.runId);
     const map = mapRef.current;
     const restore = () => {
       if (session.aoi) {
@@ -298,9 +324,79 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      projectId, surveyId, aoi: aoiRef.current, dtmId,
+      projectId, surveyId, aoi: aoiRef.current, dtmId, runId: activeRunId,
     } satisfies PersistedSession));
-  }, [projectId, surveyId, dtmId]);
+  }, [projectId, surveyId, dtmId, activeRunId]);
+
+  // -------- canonical analysis-run monitor (survives refresh) --------------
+  // The run is the single source of truth: poll it with an adaptive cadence,
+  // back off on network errors, pause while the tab is hidden, resume on
+  // visibility, and stop at a terminal state. Never polls a survey id.
+  useEffect(() => {
+    const pid = projectId;
+    const rid = activeRunId;
+    if (!pid || !rid) return;
+    let cancelled = false;
+    let timer = 0;
+    let failures = 0;
+
+    const schedule = (ms: number) => {
+      timer = window.setTimeout(tick, ms);
+    };
+    const tick = async () => {
+      if (document.hidden) {
+        schedule(3000);
+        return;
+      }
+      try {
+        const run = await api.getAnalysisRun(pid, rid);
+        if (cancelled) return;
+        failures = 0;
+        setActiveRun(run);
+        if (TERMINAL_RUN_STATES.includes(run.state)) {
+          setBusy(false);
+          setRerunning(false);
+          if (run.state === "completed" || run.state === "completed_with_warnings") {
+            setJobState("done");
+            try {
+              await loadOrthophoto(pid);
+            } catch {
+              /* optional */
+            }
+            await loadResults(pid).catch(() => undefined);
+            api.getAnalysisRuns(pid).then(setRuns).catch(() => setRuns([]));
+            api.getExportAvailability(pid).then(setExportsAvail).catch(() => undefined);
+          } else if (run.state === "failed") {
+            setJobState(`error:${run.error_message ?? "analysis failed"}`);
+          } else if (run.state === "cancelled") {
+            setJobState("");
+          }
+          return; // terminal — stop polling
+        }
+        const slow = SLOW_STAGES.includes(run.stage ?? "");
+        schedule(slow ? 5000 : 2000);
+      } catch {
+        if (cancelled) return;
+        failures += 1;
+        schedule(Math.min(2000 * 2 ** failures, 15000)); // network backoff
+      }
+    };
+    // poll immediately, then on the adaptive cadence
+    tick();
+    const onVisible = () => {
+      if (!document.hidden) {
+        window.clearTimeout(timer);
+        tick();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, activeRunId]);
 
   const setAoiOnMap = (poly: GeoJSON.Polygon | null) => {
     const src = mapRef.current?.getSource("aoi") as
@@ -539,29 +635,12 @@ export default function App() {
     pid: string,
     options: { dtmId?: string; demMode?: string; terrain?: Record<string, number> }
   ) => {
-    await api.startAnalysis(pid, options); // 404 here => stale project
-    setJobState("running:analyzing terrain");
-    pollRef.current = window.setInterval(async () => {
-      try {
-        const st = await api.getStatus(pid);
-        setJobLog(st.log.map((l) => l.msg));
-        if (st.state === "done") {
-          stopPolling();
-          setJobState("running:drawing keylines");
-          await loadResults(pid);
-          setJobState("done");
-          setBusy(false);
-        } else if (st.state.startsWith("error:")) {
-          stopPolling();
-          setJobState(st.state);
-          setBusy(false);
-        } else {
-          setJobState(st.state);
-        }
-      } catch {
-        /* transient poll failure — keep polling */
-      }
-    }, 2000);
+    // Start the run and hand tracking to the canonical run monitor (which
+    // survives refresh). Throws synchronously if the project 404s.
+    const { run_id } = await api.startAnalysisRun(pid, options);
+    setActiveRun(null);
+    setActiveRunId(run_id); // effect begins polling the run immediately
+    setJobState("running:queued");
   };
 
   /** Resolve the analysis area. For a DTM run it is the DTM footprint unless
@@ -999,36 +1078,32 @@ export default function App() {
     }
     setRerunning(true);
     setJobState("");
+    clearResults();
     try {
-      const { run_id } = await api.reanalyze(projectId, null);
-      const poll = async () => {
-        try {
-          const run = await api.getAnalysisRun(projectId, run_id);
-          setJobState(run.state === "completed" ? "done"
-            : run.state === "failed" ? `error:${run.error_message}`
-              : `running:${run.stage ?? run.state}`);
-          if (run.state === "completed") {
-            setRerunning(false);
-            clearResults();
-            try { await loadOrthophoto(projectId); } catch { /* optional */ }
-            await loadResults(projectId);
-            setJobState("done");
-            return;
-          }
-          if (run.state === "failed") {
-            setRerunning(false);
-            return;
-          }
-        } catch {
-          /* transient */
-        }
-        rerunTimer.current = window.setTimeout(() => void poll(), 2500);
-      };
-      void poll();
+      const { run_id } = await api.reanalyze(projectId, {
+        dtmId: lastDtmRef.current?.id ?? dtmId ?? null,
+      });
+      setActiveRun(null);
+      setActiveRunId(run_id); // the run monitor drives it to completion
     } catch (err) {
       setRerunning(false);
       setJobState(`error:${(err as Error).message}`);
     }
+  };
+
+  const cancelActiveRun = async () => {
+    if (!projectId || !activeRunId) return;
+    try {
+      await api.cancelAnalysisRun(projectId, activeRunId);
+    } catch {
+      /* the cooperative cancel flag is the real signal; ignore errors */
+    }
+  };
+
+  const retryActiveRun = async () => {
+    // Re-run terrain analysis with the same DTM/AOI after a failure or a
+    // confirmed stall.
+    await rerunAnalysis();
   };
   useEffect(() => stopRerunPolling, []);
 
@@ -1046,6 +1121,38 @@ export default function App() {
     jobState === "queued" || jobState.startsWith("running") ? jobState : null;
   const error = jobState.startsWith("error:") ? jobState.slice(6) : null;
   const areaTooBig = areaKm2 !== null && areaKm2 > MAX_AOI_KM2;
+
+  // The run whose products the Downloads section serves: the active run once
+  // it has completed, else the newest completed run for this project.
+  const completedActive =
+    activeRun &&
+    (activeRun.state === "completed" ||
+      activeRun.state === "completed_with_warnings")
+      ? activeRun
+      : null;
+  const downloadRun =
+    completedActive ??
+    runs.find(
+      (r) => r.state === "completed" || r.state === "completed_with_warnings"
+    ) ??
+    null;
+  const runInFlight =
+    activeRun != null && !TERMINAL_RUN_STATES.includes(activeRun.state);
+
+  const openDownload = (
+    product:
+      | "dtm"
+      | "keylines.geojson"
+      | "keylines.kml"
+      | "keyline-design-map.tif"
+      | "design-package.zip"
+  ) => {
+    if (!projectId || !downloadRun) return;
+    // Normal browser download through the configured API base (works when the
+    // Vercel frontend origin differs from the Render backend). Never fetches
+    // the file into React memory.
+    window.open(api.runDownloadUrl(projectId, downloadRun.id, product), "_blank");
+  };
 
   return (
     <div className="app">
@@ -1305,8 +1412,77 @@ export default function App() {
           )}
         </div>
 
+        {activeRun && (
+          <AnalysisProgressPanel
+            run={activeRun}
+            onCancel={cancelActiveRun}
+            onRetry={retryActiveRun}
+            onRerun={rerunAnalysis}
+          />
+        )}
+
+        {downloadRun && (
+          <div className="downloads">
+            <div className="downloads-title">Downloads</div>
+            <button
+              className="dl-btn"
+              onClick={() => openDownload("dtm")}
+              title="Untouched elevation raster used for analysis."
+            >
+              Original DTM
+            </button>
+            <button
+              className="dl-btn"
+              disabled={!downloadRun.exports.keylines_geojson}
+              title={
+                downloadRun.exports.keylines_geojson
+                  ? "Candidate keylines + keypoints (EPSG:4326)."
+                  : "No valid keyline was generated for this analysis."
+              }
+              onClick={() => openDownload("keylines.geojson")}
+            >
+              Keylines GeoJSON
+            </button>
+            <button
+              className="dl-btn"
+              disabled={!downloadRun.exports.keylines_kml}
+              title={
+                downloadRun.exports.keylines_kml
+                  ? "Candidate keylines for Google Earth."
+                  : "No valid keyline was generated for this analysis."
+              }
+              onClick={() => openDownload("keylines.kml")}
+            >
+              Keylines KML
+            </button>
+            <button
+              className="dl-btn"
+              onClick={() => openDownload("keyline-design-map.tif")}
+              title="Visual georeferenced map. This is NOT an elevation raster."
+            >
+              {downloadRun.exports.keylines_geojson
+                ? "DTM + keylines map"
+                : "Diagnostic terrain map"}
+            </button>
+            <button
+              className="dl-btn dl-primary"
+              onClick={() => openDownload("design-package.zip")}
+              title="All terrain, vector, QA, and metadata outputs."
+            >
+              Complete design package (ZIP)
+            </button>
+            {!downloadRun.exports.keylines_geojson && (
+              <div className="muted dl-note">
+                No valid keyline was generated — the design map is a diagnostic
+                terrain map, and keyline-only files are unavailable.
+              </div>
+            )}
+          </div>
+        )}
+
         {hasResults && resultsProps?.counts && (
           <div className="counts">
+            <div className="counts-title">Results</div>
             <b>Valleys {resultsProps.counts.valleys}</b> ·{" "}
             <b>Ridges {resultsProps.counts.ridges}</b> ·{" "}
             <b>Keypoints {resultsProps.counts.keypoints}</b> ·{" "}
@@ -1351,22 +1527,13 @@ export default function App() {
           </div>
         )}
 
-        {(running || error || jobState === "done") && (
+        {/* Pre-run status (project setup / validation) — the dedicated
+            AnalysisProgressPanel takes over once a run exists. */}
+        {!activeRun && (running || error) && (
           <div className="status">
             <div className={`state ${error ? "error" : ""}`}>
-              {error
-                ? `Error: ${error}`
-                : jobState === "done"
-                ? "Analysis complete"
-                : `⏳ ${jobState.replace("running:", "")}`}
+              {error ? `Error: ${error}` : `⏳ ${jobState.replace("running:", "")}`}
             </div>
-            {jobLog.length > 0 && (
-              <ul className="log">
-                {jobLog.slice(-6).map((l, i) => (
-                  <li key={i}>{l}</li>
-                ))}
-              </ul>
-            )}
           </div>
         )}
 
