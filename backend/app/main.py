@@ -779,8 +779,48 @@ def regenerate_exports(pid: str, rid: str):
     avail = exports_mod.generate_run_exports(
         out_dir, fc, aoi_wgs84=proj["aoi"] if proj else None)
     db.update_analysis_run(rid, exports_json=avail)
+    from . import artifacts as artifacts_mod
+
+    artifacts_mod.register_run_outputs(db.get_analysis_run(rid) or run, out_dir)
     return _no_store({"ok": True, "exports": _run_downloads(
         db.get_analysis_run(rid))})
+
+
+# ---------------------------------------------------------------------------
+# Artifact registry (download center)
+
+
+@app.get("/api/projects/{pid}/artifacts")
+def list_project_artifacts(pid: str, run_id: str | None = None):
+    """Download center: every registered output with size/checksum/created
+    metadata and a verified `available` flag (existence + size re-checked on
+    every listing, so a button is never shown for a vanished file)."""
+    from . import artifacts as artifacts_mod
+
+    _require_project(pid)
+    if run_id is not None:
+        _require_run(pid, run_id)
+    items = [artifacts_mod.artifact_out(a)
+             for a in db.list_artifacts(pid, run_id)]
+    return _no_store({"items": items})
+
+
+@app.get("/api/projects/{pid}/artifacts/{aid}/download")
+def download_artifact(pid: str, aid: str):
+    from . import artifacts as artifacts_mod
+
+    _require_project(pid)
+    artifact = db.get_artifact(aid)
+    if artifact is None or artifact["project_id"] != pid:
+        raise HTTPException(404, "Artifact not found in this project")
+    ok, reason = artifacts_mod.verify_artifact(artifact)
+    if not ok:
+        raise HTTPException(410, f"Artifact is no longer available: {reason}")
+    filename = artifact.get("original_filename") or f"{aid}.bin"
+    return FileResponse(
+        artifact["stored_path"],
+        media_type=artifact.get("mime_type") or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 # ---------------------------------------------------------------------------
@@ -898,6 +938,15 @@ def download_run_design_package(pid: str, rid: str):
             orthophoto_path=ortho if os.path.isfile(ortho) else None)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(422, f"Could not build design package: {exc}")
+    from . import artifacts as artifacts_mod
+
+    artifacts_mod.register_file(
+        zip_path, project_id=pid, run_id=rid,
+        artifact_type="design_package_zip",
+        download_filename="design-package.zip",
+        algorithm_version=run.get("analysis_version"),
+        created_by="api", metadata={"description":
+                                    "Complete design package (ZIP)"})
     return FileResponse(
         zip_path, media_type="application/zip",
         headers={"Content-Disposition":

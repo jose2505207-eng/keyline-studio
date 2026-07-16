@@ -328,10 +328,16 @@ def build_design_package(zip_path: str, *, out_dir: str, fc: dict,
     return zip_path
 
 
+def _write_atomic_bytes(path: str, data: bytes) -> None:
+    from .spatial import atomic_write_bytes
+
+    atomic_write_bytes(path, data)
+
+
 def generate_run_exports(out_dir: str, fc: dict,
                          aoi_wgs84: dict | None = None) -> dict:
-    """Produce the heavy standing export (visual GeoTIFF) for a completed run
-    and report availability. Lightweight text exports are generated on demand.
+    """Produce the standing export files for a completed run under
+    ``<out_dir>/exports/`` and report availability.
 
     Never reruns hydrology; only reads the run's existing rasters/vectors. An
     export failure is reported (not raised) so a completed terrain analysis is
@@ -346,10 +352,35 @@ def generate_run_exports(out_dir: str, fc: dict,
         "keylines_geojson": has_keylines,
         "keylines_kml": has_keylines,
         "terrain_layers_geojson": has_vectors,
+        "terrain_gpkg": False,
         "visual_geotiff": False,
         "design_bundle": True,
         "errors": {},
     }
+    exports_dir = os.path.join(out_dir, "exports")
+    os.makedirs(exports_dir, exist_ok=True)
+
+    # Keyline vector files: materialized so they can be registered as
+    # verifiable artifacts (checksums, sizes) instead of built per request.
+    if has_keylines:
+        try:
+            sub = keylines_geojson(fc)
+            _write_atomic_bytes(os.path.join(exports_dir, "keylines.geojson"),
+                                json.dumps(sub).encode())
+            doc_name = (fc.get("properties") or {}).get("project_id") or "keylines"
+            _write_atomic_bytes(
+                os.path.join(exports_dir, "keylines.kml"),
+                keylines_kml(fc, f"Keylines — {doc_name}").encode())
+        except (ExportUnavailable, OSError) as exc:
+            avail["errors"]["keylines_files"] = str(exc)
+
+    if has_vectors:
+        try:
+            terrain_gpkg(fc, os.path.join(exports_dir, "terrain.gpkg"))
+            avail["terrain_gpkg"] = True
+        except Exception as exc:  # noqa: BLE001 — optional export
+            avail["errors"]["terrain_gpkg"] = str(exc)
+
     # Visual GeoTIFF: a diagnostic terrain map is still useful with no keyline,
     # so build it whenever there is any raster to render.
     dest = os.path.join(out_dir, "keyline-design-map.tif")

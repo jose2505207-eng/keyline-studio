@@ -144,6 +144,20 @@ def execute_analysis_run(run_id: str,
             avail = {"errors": {"exports": str(exc)}}
         db.update_analysis_run(run_id, exports_json=avail)
 
+        # Register everything that verifiably exists as durable artifacts
+        # (checksums, sizes, MIME, raster metadata). Failure to register is a
+        # warning, never a run failure.
+        try:
+            from .. import artifacts as artifacts_mod
+
+            current = db.get_analysis_run(run_id) or {"id": run_id,
+                                                      "project_id": project["id"]}
+            registered = artifacts_mod.register_run_outputs(current, out_dir)
+            lg.info("registered %d artifacts: %s", len(registered),
+                    sorted(registered))
+        except Exception as exc:  # noqa: BLE001
+            lg.warning("artifact registration failed: %s", exc)
+
         reporter.start_stage(prog.SAVING_RESULTS, "saving results")
 
         # The terrain analysis itself succeeded. Per the error-behaviour spec,

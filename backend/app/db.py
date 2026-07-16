@@ -50,12 +50,17 @@ def init_db() -> None:
         migrations.migrate(c)
 
 
-def create_project(name: str, aoi: dict) -> str:
+def create_project(name: str, aoi: dict, org_id: str | None = None,
+                   ranch_id: str | None = None) -> str:
+    from .migrations import DEFAULT_ORG_ID, DEFAULT_RANCH_ID
+
     pid = uuid.uuid4().hex[:12]
     with _conn() as c:
         c.execute(
-            "INSERT INTO projects (id, name, aoi, created_at) VALUES (?,?,?,?)",
-            (pid, name, json.dumps(aoi), time.time()),
+            "INSERT INTO projects (id, name, aoi, org_id, ranch_id, "
+            "created_at) VALUES (?,?,?,?,?,?)",
+            (pid, name, json.dumps(aoi), org_id or DEFAULT_ORG_ID,
+             ranch_id or DEFAULT_RANCH_ID, time.time()),
         )
     return pid
 
@@ -328,6 +333,93 @@ def claim_analysis_run(rid: str, worker: str, stale_after: float = 120.0) -> boo
 
 
 # ---------------------------------------------------------------------------
+# Tenancy: organizations, ranches, users, API tokens, audit log
+
+
+def create_organization(name: str) -> str:
+    oid = "org_" + uuid.uuid4().hex[:12]
+    with _conn() as c:
+        c.execute("INSERT INTO organizations (id, name, created_at) "
+                  "VALUES (?,?,?)", (oid, name, time.time()))
+    return oid
+
+
+def get_organization(oid: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM organizations WHERE id=?",
+                        (oid,)).fetchone()
+    return dict(row) if row else None
+
+
+def create_ranch(org_id: str, name: str,
+                 geometry: dict | None = None) -> str:
+    rid = "ranch_" + uuid.uuid4().hex[:12]
+    with _conn() as c:
+        c.execute("INSERT INTO ranches (id, org_id, name, geometry_json, "
+                  "created_at) VALUES (?,?,?,?,?)",
+                  (rid, org_id, name,
+                   json.dumps(geometry) if geometry else None, time.time()))
+    return rid
+
+
+def list_ranches(org_id: str) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM ranches WHERE org_id=? "
+                         "ORDER BY created_at", (org_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_user(org_id: str, email: str | None, name: str | None,
+                role: str = "owner") -> str:
+    uid = "user_" + uuid.uuid4().hex[:12]
+    with _conn() as c:
+        c.execute("INSERT INTO users (id, org_id, email, name, role, "
+                  "created_at) VALUES (?,?,?,?,?,?)",
+                  (uid, org_id, email, name, role, time.time()))
+    return uid
+
+
+def get_user(uid: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    return dict(row) if row else None
+
+
+def create_api_token(user_id: str, token_hash: str,
+                     label: str | None = None) -> str:
+    tid = "tok_" + uuid.uuid4().hex[:12]
+    with _conn() as c:
+        c.execute("INSERT INTO api_tokens (id, user_id, token_hash, label, "
+                  "created_at) VALUES (?,?,?,?,?)",
+                  (tid, user_id, token_hash, label, time.time()))
+    return tid
+
+
+def user_for_token_hash(token_hash: str) -> dict | None:
+    """The user owning a token, with the token's id attached. Updates
+    last_used_at as a side effect (coarse — once per request is fine)."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT u.*, t.id AS token_id FROM api_tokens t "
+            "JOIN users u ON u.id = t.user_id WHERE t.token_hash=?",
+            (token_hash,)).fetchone()
+        if row is None:
+            return None
+        c.execute("UPDATE api_tokens SET last_used_at=? WHERE id=?",
+                  (time.time(), row["token_id"]))
+    return dict(row)
+
+
+def audit(action: str, *, user_id: str | None = None,
+          org_id: str | None = None, resource: str | None = None,
+          detail: str | None = None) -> None:
+    with _conn() as c:
+        c.execute("INSERT INTO audit_log (t, user_id, org_id, action, "
+                  "resource, detail) VALUES (?,?,?,?,?,?)",
+                  (time.time(), user_id, org_id, action, resource, detail))
+
+
+# ---------------------------------------------------------------------------
 # Artifacts (durable records for every generated/ingested output file)
 
 _ARTIFACT_JSON_FIELDS = {"bounds_json", "resolution_json", "metadata_json"}
@@ -433,19 +525,23 @@ def create_dtm(*, storage_path: str, display_name: str,
                crs: str | None, width: int | None, height: int | None,
                nodata: float | None, survey_id: str | None = None,
                project_id: str | None = None, status: str = "ready",
-               metadata: dict | None = None) -> str:
+               metadata: dict | None = None,
+               org_id: str | None = None) -> str:
+    from .migrations import DEFAULT_ORG_ID
+
     did = "dtm_" + uuid.uuid4().hex[:12]
     now = time.time()
     with _conn() as c:
         c.execute(
             "INSERT INTO dtms (id, storage_path, display_name, "
             "original_filename, source_type, status, size_bytes, checksum, "
-            "crs, width, height, nodata, survey_id, project_id, "
+            "crs, width, height, nodata, survey_id, project_id, org_id, "
             "metadata_json, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (did, storage_path, display_name, original_filename, source_type,
              status, size_bytes, checksum, crs, width, height, nodata,
-             survey_id, project_id, json.dumps(metadata or {}), now, now),
+             survey_id, project_id, org_id or DEFAULT_ORG_ID,
+             json.dumps(metadata or {}), now, now),
         )
     return did
 

@@ -82,6 +82,81 @@ def _add_execution_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE analysis_runs ADD COLUMN {name} {decl}")
 
 
+DEFAULT_ORG_ID = "org_default"
+DEFAULT_RANCH_ID = "ranch_default"
+
+
+def _add_tenancy(conn: sqlite3.Connection) -> None:
+    """Migration 8: Organization -> Ranch -> Project hierarchy + users,
+    API tokens and an audit log.
+
+    Existing projects and DTMs are backfilled into a default organization/
+    ranch so nothing breaks for single-user deployments; auth stays opt-in
+    (AUTH_MODE env). Additive and idempotent."""
+    import time as _time
+
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS organizations (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_at REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS ranches (
+        id TEXT PRIMARY KEY,
+        org_id TEXT NOT NULL REFERENCES organizations(id),
+        name TEXT NOT NULL,
+        geometry_json TEXT,
+        created_at REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        org_id TEXT NOT NULL REFERENCES organizations(id),
+        email TEXT UNIQUE,
+        name TEXT,
+        role TEXT NOT NULL DEFAULT 'owner',
+        created_at REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS api_tokens (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id),
+        token_hash TEXT NOT NULL UNIQUE,
+        label TEXT,
+        created_at REAL NOT NULL,
+        last_used_at REAL
+    );
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        t REAL NOT NULL,
+        user_id TEXT,
+        org_id TEXT,
+        action TEXT NOT NULL,
+        resource TEXT,
+        detail TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ranches_org ON ranches(org_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_t ON audit_log(t);
+    """)
+    now = _time.time()
+    conn.execute(
+        "INSERT OR IGNORE INTO organizations (id, name, created_at) "
+        "VALUES (?, 'Default Organization', ?)", (DEFAULT_ORG_ID, now))
+    conn.execute(
+        "INSERT OR IGNORE INTO ranches (id, org_id, name, created_at) "
+        "VALUES (?, ?, 'Default Ranch', ?)",
+        (DEFAULT_RANCH_ID, DEFAULT_ORG_ID, now))
+    for table in ("projects", "dtms"):
+        existing = {row[1] for row in
+                    conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "org_id" not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN org_id TEXT")
+        if table == "projects" and "ranch_id" not in existing:
+            conn.execute("ALTER TABLE projects ADD COLUMN ranch_id TEXT")
+        conn.execute(f"UPDATE {table} SET org_id=? WHERE org_id IS NULL",
+                     (DEFAULT_ORG_ID,))
+    conn.execute("UPDATE projects SET ranch_id=? WHERE ranch_id IS NULL",
+                 (DEFAULT_RANCH_ID,))
+
+
 MIGRATIONS: list[tuple[int, Union[str, Callable[[sqlite3.Connection], None]]]] = [
     (
         1,
@@ -206,11 +281,15 @@ MIGRATIONS: list[tuple[int, Union[str, Callable[[sqlite3.Connection], None]]]] =
             ON artifacts(run_id, artifact_type);
         """,
     ),
+    (8, _add_tenancy),
 ]
 
 
 def migrate(conn: sqlite3.Connection) -> int:
     """Apply pending migrations; returns the resulting schema version."""
+    versions = [v for v, _ in MIGRATIONS]
+    assert versions == sorted(versions), \
+        "MIGRATIONS must be listed in ascending version order"
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_version "
         "(version INTEGER NOT NULL)"
