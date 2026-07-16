@@ -16,10 +16,16 @@ import re
 import tempfile
 import uuid
 
-from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi import APIRouter, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from . import config, db
+
+
+def _actor_org(request: Request) -> str:
+    from .auth import DEFAULT_ACTOR
+
+    return getattr(request.state, "actor", DEFAULT_ACTOR).org_id
 
 log = logging.getLogger(__name__)
 
@@ -184,6 +190,7 @@ def register_survey_dtms() -> None:
                 nodata=meta.get("nodata"),
                 survey_id=s["id"],
                 project_id=s["project_id"],
+                org_id=s.get("org_id"),
                 status="ready" if available else "missing",
                 metadata=meta,
             )
@@ -293,10 +300,11 @@ def _dtm_out(d: dict, include_footprint: bool = True) -> DtmOut:
 
 
 @router.get("", response_model=DtmListOut)
-def list_dtms():
+def list_dtms(request: Request):
     ensure_dtm_dir()
     register_survey_dtms()
-    items = [refresh_dtm_status(d) for d in db.list_dtms()]
+    items = [refresh_dtm_status(d)
+             for d in db.list_dtms(org_id=_actor_org(request))]
     # list stays light: bbox/center included, full footprint via detail
     return DtmListOut(items=[_dtm_out(d, include_footprint=False)
                              for d in items])
@@ -332,7 +340,8 @@ def get_dtm(dtm_id: str):
 
 
 @router.post("/upload", response_model=DtmOut)
-async def upload_dtm(file: UploadFile, project_id: str | None = None):
+async def upload_dtm(file: UploadFile, request: Request,
+                     project_id: str | None = None):
     original = _sanitize_name(file.filename or "dtm.tif")
     if not original.lower().endswith(_TIFF_EXTENSIONS):
         raise HTTPException(422, "Only .tif/.tiff GeoTIFF files are accepted")
@@ -371,7 +380,8 @@ async def upload_dtm(file: UploadFile, project_id: str | None = None):
         original_filename=original, source_type="upload",
         size_bytes=meta["size_bytes"], checksum=md5.hexdigest(),
         crs=meta["crs"], width=meta["width"], height=meta["height"],
-        nodata=meta["nodata"], project_id=project_id, metadata=meta)
+        nodata=meta["nodata"], project_id=project_id, metadata=meta,
+        org_id=_actor_org(request))
     return _dtm_out(db.get_dtm(did))
 
 
@@ -387,7 +397,7 @@ def validate_path(body: ValidatePathIn):
 
 
 @router.post("/import-path", response_model=DtmOut)
-def import_path(body: ImportPathIn):
+def import_path(body: ImportPathIn, request: Request):
     import shutil
 
     try:
@@ -421,5 +431,6 @@ def import_path(body: ImportPathIn):
         original_filename=display, source_type=source_type,
         size_bytes=meta["size_bytes"], checksum=md5.hexdigest(),
         crs=meta["crs"], width=meta["width"], height=meta["height"],
-        nodata=meta["nodata"], project_id=body.project_id, metadata=meta)
+        nodata=meta["nodata"], project_id=body.project_id, metadata=meta,
+        org_id=_actor_org(request))
     return _dtm_out(db.get_dtm(did))

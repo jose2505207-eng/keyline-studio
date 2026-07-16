@@ -552,10 +552,19 @@ def get_dtm(did: str) -> dict | None:
     return _dtm_row_to_dict(row) if row else None
 
 
-def list_dtms() -> list[dict]:
+def list_dtms(org_id: str | None = None) -> list[dict]:
+    from .migrations import DEFAULT_ORG_ID
+
     with _conn() as c:
-        rows = c.execute(
-            "SELECT * FROM dtms ORDER BY created_at DESC").fetchall()
+        if org_id is None:
+            rows = c.execute(
+                "SELECT * FROM dtms ORDER BY created_at DESC").fetchall()
+        else:
+            # legacy rows with NULL org belong to the default organization
+            rows = c.execute(
+                "SELECT * FROM dtms WHERE COALESCE(org_id, ?) = ? "
+                "ORDER BY created_at DESC",
+                (DEFAULT_ORG_ID, org_id)).fetchall()
     return [_dtm_row_to_dict(r) for r in rows]
 
 
@@ -594,7 +603,8 @@ def surveys_with_dtm() -> list[dict]:
     with _conn() as c:
         rows = c.execute(
             "SELECT s.id, s.project_id, s.dtm_path, s.completed_at, "
-            "p.name AS project_name FROM drone_surveys s "
+            "p.name AS project_name, p.org_id AS org_id "
+            "FROM drone_surveys s "
             "JOIN projects p ON p.id = s.project_id "
             "WHERE s.dtm_path IS NOT NULL").fetchall()
     return [dict(r) for r in rows]

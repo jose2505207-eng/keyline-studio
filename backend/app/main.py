@@ -34,6 +34,52 @@ DATA_DIR = os.environ.get(
 )
 
 app = FastAPI(title="Keyline Studio API")
+
+
+_AUDITED = __import__("re").compile(
+    r"^/api/projects/[^/]+/(analyze|reanalyze|"
+    r"analysis-runs/[^/]+/(retry|cancel)|drone-dem)$"
+    r"|^/api/dtms/(upload|import-path)$"
+    r"|/downloads?/|/artifacts/[^/]+/download$")
+
+
+@app.middleware("http")
+async def tenancy_middleware(request: Request, call_next):
+    """Actor resolution + org scoping + role checks + rate limiting + audit
+    trail + security headers. In AUTH_MODE=disabled everything acts as the
+    default organization's owner (backward compatible)."""
+    from starlette.responses import JSONResponse as _JSON
+
+    from . import auth
+
+    method = request.method
+    path = request.url.path
+    try:
+        actor = await __import__("anyio").to_thread.run_sync(
+            auth.check_request, method, path,
+            request.headers.get("authorization"))
+        rate_key = actor.user_id or (request.client.host
+                                     if request.client else "anon")
+        auth.check_rate_limit(method, path, rate_key)
+    except auth.TenancyError as exc:
+        return _JSON({"detail": exc.message}, status_code=exc.status)
+    request.state.actor = actor
+    response = await call_next(request)
+    if _AUDITED.search(path):
+        try:
+            db.audit(f"{method} {path}", user_id=actor.user_id,
+                     org_id=actor.org_id,
+                     detail=f"status={response.status_code}")
+        except Exception:  # noqa: BLE001 — auditing must never break a request
+            log.debug("audit write failed", exc_info=True)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    return response
+
+
+# CORS is registered after the tenancy middleware so it wraps it (auth
+# error responses still carry CORS headers for browser clients).
 app.add_middleware(
     CORSMiddleware,
     # Vite dev server origins + the Vercel-hosted frontend
@@ -42,6 +88,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _actor(request: Request):
+    from .auth import DEFAULT_ACTOR
+
+    return getattr(request.state, "actor", DEFAULT_ACTOR)
 
 
 @app.on_event("startup")
@@ -98,6 +150,30 @@ def project_dir(pid: str) -> str:
 class ProjectIn(BaseModel):
     name: str
     aoi: dict  # GeoJSON Polygon, WGS84
+    ranch_id: str | None = None
+
+
+class RanchIn(BaseModel):
+    name: str
+    geometry: dict | None = None  # GeoJSON, WGS84
+
+
+@app.get("/api/ranches")
+def list_ranches(request: Request):
+    actor = _actor(request)
+    return {"items": [
+        {"id": r["id"], "name": r["name"], "org_id": r["org_id"],
+         "geometry": json.loads(r["geometry_json"])
+         if r.get("geometry_json") else None,
+         "created_at": r["created_at"]}
+        for r in db.list_ranches(actor.org_id)]}
+
+
+@app.post("/api/ranches")
+def create_ranch(body: RanchIn, request: Request):
+    actor = _actor(request)
+    rid = db.create_ranch(actor.org_id, body.name, body.geometry)
+    return {"ranch_id": rid}
 
 
 class MoveIn(BaseModel):
@@ -115,13 +191,20 @@ def _require_project(pid: str) -> dict:
 
 
 @app.post("/api/projects")
-def create_project(body: ProjectIn):
+def create_project(body: ProjectIn, request: Request):
     geom = body.aoi.get("geometry", body.aoi)  # accept Feature or bare geometry
     if geom.get("type") != "Polygon":
         raise HTTPException(422, "aoi must be a GeoJSON Polygon")
-    pid = db.create_project(body.name, geom)
+    actor = _actor(request)
+    ranch_id = body.ranch_id
+    if ranch_id and not any(r["id"] == ranch_id
+                            for r in db.list_ranches(actor.org_id)):
+        raise HTTPException(404, "Ranch not found")
+    pid = db.create_project(body.name, geom, org_id=actor.org_id,
+                            ranch_id=ranch_id)
     os.makedirs(project_dir(pid), exist_ok=True)
-    log.info("project created id=%s name=%r", pid, body.name)
+    log.info("project created id=%s name=%r org=%s", pid, body.name,
+             actor.org_id)
     return {"project_id": pid}
 
 
@@ -134,9 +217,12 @@ def get_project(pid: str):
     return {
         "project_id": pid,
         "name": proj["name"],
+        "org_id": proj.get("org_id"),
+        "ranch_id": proj.get("ranch_id"),
         "has_drone_dtm": bool(proj.get("drone_path")
                               and os.path.isfile(proj["drone_path"])),
         "has_results": bool(run and run.get("result_dir")),
+        "latest_run_id": (run or {}).get("id"),
     }
 
 
@@ -147,7 +233,7 @@ async def upload_drone_dem(pid: str, file: UploadFile):
     that it isn't all nodata, and that elevations are plausible; reports the
     detected CRS/resolution/bounds and a WGS84 footprint so the user can
     confirm it landed in the right place."""
-    _require_project(pid)
+    proj = _require_project(pid)
     import numpy as np
     import rasterio
     from pyproj import Transformer
@@ -205,7 +291,8 @@ async def upload_drone_dem(pid: str, file: UploadFile):
                 original_filename=file.filename, source_type="upload",
                 size_bytes=meta["size_bytes"], checksum=None,
                 crs=meta["crs"], width=meta["width"], height=meta["height"],
-                nodata=meta["nodata"], project_id=pid, metadata=meta)
+                nodata=meta["nodata"], project_id=pid, metadata=meta,
+                org_id=proj.get("org_id"))
         except DtmPathError as exc:
             import logging
 
@@ -1222,6 +1309,47 @@ def attach_map(pid: str, body: AttachMapIn):
 # Admin: runtime provider-URL update (used by the self-healing tunnel script).
 # Guarded by ADMIN_TOKEN; the candidate URL must answer as a live NodeODM
 # before it is applied, so a typo or dead tunnel can never be persisted.
+
+
+def _require_admin(request: Request) -> None:
+    import secrets as _secrets
+
+    token = os.environ.get("ADMIN_TOKEN", "")
+    supplied = request.headers.get("x-admin-token", "")
+    if not token or not _secrets.compare_digest(supplied, token):
+        raise HTTPException(403, "Admin token missing or invalid")
+
+
+class CreateUserIn(BaseModel):
+    email: str
+    name: str | None = None
+    role: str = "owner"
+    org_id: str | None = None      # join an existing organization…
+    org_name: str | None = None    # …or create a new one
+
+
+@app.post("/api/admin/users")
+def admin_create_user(body: CreateUserIn, request: Request):
+    """Bootstrap users + API tokens for AUTH_MODE=token deployments.
+    Guarded by ADMIN_TOKEN. The raw token is returned exactly once."""
+    from . import auth
+
+    _require_admin(request)
+    if body.role not in auth.ROLES:
+        raise HTTPException(422, f"role must be one of {', '.join(auth.ROLES)}")
+    org_id = body.org_id
+    if org_id:
+        if db.get_organization(org_id) is None:
+            raise HTTPException(404, "Organization not found")
+    else:
+        org_id = db.create_organization(body.org_name or body.email)
+    uid = db.create_user(org_id, body.email, body.name, body.role)
+    token = auth.issue_token(uid, label=f"bootstrap:{body.email}")
+    db.audit("admin.create_user", org_id=org_id, resource=uid,
+             detail=f"role={body.role}")
+    return {"user_id": uid, "org_id": org_id, "role": body.role,
+            "token": token,
+            "note": "Store this token now — it is not shown again."}
 
 
 class ProviderUrlIn(BaseModel):
