@@ -25,16 +25,33 @@ export interface FeatureCollection {
   features: GeoJSON.Feature[];
 }
 
+/** Error carrying the HTTP status and the raw `detail` payload so callers
+ * can react to structured conflicts (e.g. 409 duplicate-start reports the
+ * already-active run id). `message` stays human-readable. */
+export class ApiError extends Error {
+  status: number;
+  detail: unknown;
+  constructor(status: number, detail: unknown) {
+    super(
+      typeof detail === "string"
+        ? detail
+        : ((detail as { message?: string })?.message ?? JSON.stringify(detail))
+    );
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 async function jsonOrThrow(res: Response) {
   if (!res.ok) {
-    let detail = res.statusText;
+    let detail: unknown = res.statusText;
     try {
       const body = await res.json();
-      detail = body.detail ?? JSON.stringify(body);
+      detail = body.detail ?? body;
     } catch {
       /* keep statusText */
     }
-    throw new Error(detail);
+    throw new ApiError(res.status, detail);
   }
   return res.json();
 }
@@ -61,24 +78,6 @@ export interface ProjectSummary {
 export async function getProject(projectId: string): Promise<ProjectSummary | null> {
   const res = await fetch(url(`/api/projects/${projectId}`));
   if (res.status === 404) return null;
-  return jsonOrThrow(res);
-}
-
-export interface DroneInfo {
-  crs: string;
-  resolution_m: [number, number];
-  size_px: [number, number];
-  elevation_range_m: [number, number];
-  footprint: GeoJSON.Polygon;
-}
-
-export async function uploadDroneDem(projectId: string, file: File): Promise<DroneInfo> {
-  const form = new FormData();
-  form.append("file", file);
-  const res = await fetch(url(`/api/projects/${projectId}/drone-dem`), {
-    method: "POST",
-    body: form,
-  });
   return jsonOrThrow(res);
 }
 
@@ -156,27 +155,6 @@ export async function attachMap(projectId: string, mapId: string): Promise<void>
     body: JSON.stringify({ map_id: mapId }),
   });
   await jsonOrThrow(res);
-}
-
-export async function startAnalysis(
-  projectId: string,
-  options: { dtmId?: string; demMode?: string; terrain?: Record<string, number> } = {}
-): Promise<string> {
-  const res = await fetch(url(`/api/projects/${projectId}/analyze`), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      dtm_id: options.dtmId ?? null,
-      dem_mode: options.demMode ?? "auto",
-      terrain: options.terrain ?? null,
-    }),
-  });
-  const body = await jsonOrThrow(res);
-  return body.job_id;
-}
-
-export async function getStatus(projectId: string): Promise<JobStatus> {
-  return jsonOrThrow(await fetch(url(`/api/projects/${projectId}/status`)));
 }
 
 export async function getResults(projectId: string): Promise<FeatureCollection> {
@@ -559,6 +537,10 @@ export interface AnalysisRun {
   health: string; // active|slow|possibly_stalled|worker_missing|failed|complete
   health_message: string | null;
   cancellable: boolean;
+  retryable: boolean;
+  executor: string | null; // rq | inline
+  retry_of: string | null;
+  retry_count: number;
   worker: { rq_job_id: string | null; status: string | null; worker_name: string | null };
   exports: RunExports;
   log?: RunLogEntry[];
@@ -668,6 +650,83 @@ export async function getAnalysisRun(
       cache: "no-store",
     })
   );
+}
+
+export async function retryAnalysisRun(
+  projectId: string,
+  runId: string
+): Promise<{ run_id: string; retry_of: string; state: string }> {
+  return jsonOrThrow(
+    await fetch(url(`/api/projects/${projectId}/analysis-runs/${runId}/retry`), {
+      method: "POST",
+    })
+  );
+}
+
+/** Live progress via Server-Sent Events. Calls `onRun` for every pushed run
+ * snapshot and `onEnd` when the run reaches a terminal state. Returns the
+ * EventSource; the caller must close it. On `error` events the caller should
+ * close and fall back to polling — the polling endpoint shows the same
+ * truth. */
+export function openRunEvents(
+  projectId: string,
+  runId: string,
+  handlers: {
+    onRun: (run: AnalysisRun) => void;
+    onEnd?: () => void;
+    onError?: () => void;
+  }
+): EventSource {
+  const es = new EventSource(
+    url(`/api/projects/${projectId}/analysis-runs/${runId}/events`)
+  );
+  es.addEventListener("run", (e) => {
+    try {
+      handlers.onRun(JSON.parse((e as MessageEvent).data));
+    } catch {
+      /* malformed frame: ignore; polling fallback still covers us */
+    }
+  });
+  es.addEventListener("end", () => handlers.onEnd?.());
+  es.addEventListener("gone", () => handlers.onError?.());
+  es.onerror = () => handlers.onError?.();
+  return es;
+}
+
+// ---- artifact download center -------------------------------------------------
+
+export interface Artifact {
+  id: string;
+  project_id: string;
+  run_id: string | null;
+  artifact_type: string;
+  filename: string | null;
+  description: string | null;
+  mime_type: string | null;
+  size_bytes: number | null;
+  checksum_sha256: string | null;
+  crs: string | null;
+  algorithm_version: string | null;
+  created_at: number | null;
+  available: boolean;
+  unavailable_reason: string | null;
+}
+
+export async function listArtifacts(
+  projectId: string,
+  runId?: string | null
+): Promise<Artifact[]> {
+  const q = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+  const body = await jsonOrThrow(
+    await fetch(url(`/api/projects/${projectId}/artifacts${q}`), {
+      cache: "no-store",
+    })
+  );
+  return body.items;
+}
+
+export function artifactDownloadUrl(projectId: string, artifactId: string): string {
+  return url(`/api/projects/${projectId}/artifacts/${artifactId}/download`);
 }
 
 export async function cancelAnalysisRun(

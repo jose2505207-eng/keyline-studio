@@ -906,6 +906,26 @@ body,
 .dl-primary:hover:not(:disabled) { background: #245cbb; }
 .dl-note { font-size: 11px; }
 
+.artifact-list {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed #ddd;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.artifact-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+.artifact-name { color: #2b6bd6; text-decoration: none; }
+.artifact-name:hover { text-decoration: underline; }
+.artifact-missing { color: #aaa; }
+.artifact-meta { font-size: 11px; white-space: nowrap; }
+
 .dtm-fillsat {
   display: flex;
   align-items: flex-start;

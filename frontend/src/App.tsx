@@ -109,7 +109,6 @@ export default function App() {
 
   const [projectId, setProjectId] = useState<string | null>(null);
   const [drawing, setDrawing] = useState(false);
-  const [droneName, setDroneName] = useState<string | null>(null);
   const [jobState, setJobState] = useState<string>("");
   const [jobLog, setJobLog] = useState<string[]>([]);
   const [hasResults, setHasResults] = useState(false);
@@ -119,8 +118,6 @@ export default function App() {
   const [searchQ, setSearchQ] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [warning, setWarning] = useState<string | null>(null);
-  const [droneInfo, setDroneInfo] = useState<api.DroneInfo | null>(null);
-  const [isDsm, setIsDsm] = useState(false);
   const [terrainSource, setTerrainSource] = useState<"drone" | "dtm" | "satellite">("satellite");
   const [dtmId, setDtmId] = useState<string | null>(null);
   const [exportsAvail, setExportsAvail] = useState<api.ExportAvailability | null>(null);
@@ -130,6 +127,13 @@ export default function App() {
   const [orthoOpacity, setOrthoOpacity] = useState(0.9);
   const [resultsProps, setResultsProps] = useState<api.ResultsProperties | null>(null);
   const [runs, setRuns] = useState<api.AnalysisRun[]>([]);
+  const [artifacts, setArtifacts] = useState<api.Artifact[]>([]);
+  const fmtBytes = (b: number | null): string => {
+    if (b == null) return "";
+    if (b > 1 << 20) return `${(b / (1 << 20)).toFixed(1)} MB`;
+    if (b > 1 << 10) return `${(b / (1 << 10)).toFixed(0)} KB`;
+    return `${b} B`;
+  };
   const [rerunning, setRerunning] = useState(false);
   const rerunTimer = useRef<number | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
@@ -335,21 +339,53 @@ export default function App() {
   }, [projectId, surveyId, dtmId, activeRunId]);
 
   // -------- canonical analysis-run monitor (survives refresh) --------------
-  // The run is the single source of truth: poll it with an adaptive cadence,
-  // back off on network errors, pause while the tab is hidden, resume on
-  // visibility, and stop at a terminal state. Never polls a survey id.
+  // The run is the single source of truth. Live updates arrive over SSE when
+  // the browser/backend support it; polling always runs as the safety net
+  // (slow cadence while SSE is healthy, adaptive 2/5 s cadence otherwise,
+  // network backoff, hidden-tab pause). Both paths read the same persisted
+  // run record, so a dropped stream can never show a different truth.
   useEffect(() => {
     const pid = projectId;
     const rid = activeRunId;
     if (!pid || !rid) return;
     let cancelled = false;
+    let terminal = false;
     let timer = 0;
     let failures = 0;
+    let es: EventSource | null = null;
+    let sseHealthy = false;
+
+    const handleRun = async (run: api.AnalysisRun) => {
+      if (cancelled || terminal) return;
+      setActiveRun(run);
+      if (TERMINAL_RUN_STATES.includes(run.state)) {
+        terminal = true;
+        es?.close();
+        setBusy(false);
+        setRerunning(false);
+        if (run.state === "completed" || run.state === "completed_with_warnings") {
+          setJobState("done");
+          try {
+            await loadOrthophoto(pid);
+          } catch {
+            /* optional */
+          }
+          await loadResults(pid).catch(() => undefined);
+          api.getAnalysisRuns(pid).then(setRuns).catch(() => setRuns([]));
+          api.getExportAvailability(pid).then(setExportsAvail).catch(() => undefined);
+        } else if (run.state === "failed") {
+          setJobState(`error:${run.error_message ?? "analysis failed"}`);
+        } else if (run.state === "cancelled") {
+          setJobState("");
+        }
+      }
+    };
 
     const schedule = (ms: number) => {
       timer = window.setTimeout(tick, ms);
     };
     const tick = async () => {
+      if (terminal || cancelled) return;
       if (document.hidden) {
         schedule(3000);
         return;
@@ -358,39 +394,40 @@ export default function App() {
         const run = await api.getAnalysisRun(pid, rid);
         if (cancelled) return;
         failures = 0;
-        setActiveRun(run);
-        if (TERMINAL_RUN_STATES.includes(run.state)) {
-          setBusy(false);
-          setRerunning(false);
-          if (run.state === "completed" || run.state === "completed_with_warnings") {
-            setJobState("done");
-            try {
-              await loadOrthophoto(pid);
-            } catch {
-              /* optional */
-            }
-            await loadResults(pid).catch(() => undefined);
-            api.getAnalysisRuns(pid).then(setRuns).catch(() => setRuns([]));
-            api.getExportAvailability(pid).then(setExportsAvail).catch(() => undefined);
-          } else if (run.state === "failed") {
-            setJobState(`error:${run.error_message ?? "analysis failed"}`);
-          } else if (run.state === "cancelled") {
-            setJobState("");
-          }
-          return; // terminal — stop polling
+        await handleRun(run);
+        if (terminal) return; // stop polling
+        if (sseHealthy) {
+          schedule(15000); // SSE is delivering; poll is just a safety net
+        } else {
+          const slow = SLOW_STAGES.includes(run.stage ?? "");
+          schedule(slow ? 5000 : 2000);
         }
-        const slow = SLOW_STAGES.includes(run.stage ?? "");
-        schedule(slow ? 5000 : 2000);
       } catch {
         if (cancelled) return;
         failures += 1;
         schedule(Math.min(2000 * 2 ** failures, 15000)); // network backoff
       }
     };
+
+    if (typeof EventSource !== "undefined") {
+      es = api.openRunEvents(pid, rid, {
+        onRun: (run) => {
+          sseHealthy = true;
+          void handleRun(run);
+        },
+        onEnd: () => es?.close(),
+        onError: () => {
+          // stream lost: polling resumes at the normal cadence
+          sseHealthy = false;
+          es?.close();
+          es = null;
+        },
+      });
+    }
     // poll immediately, then on the adaptive cadence
     tick();
     const onVisible = () => {
-      if (!document.hidden) {
+      if (!document.hidden && !terminal) {
         window.clearTimeout(timer);
         tick();
       }
@@ -399,6 +436,7 @@ export default function App() {
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
+      es?.close();
       document.removeEventListener("visibilitychange", onVisible);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -600,10 +638,7 @@ export default function App() {
   const handleAoiDrawn = useCallback(async (aoi: GeoJSON.Polygon) => {
     clearResults();
     removeOrthoLayer();
-    setDroneName(null);
-    setDroneInfo(null);
     setDroneFootprint(null);
-    setIsDsm(false);
     setSurveyId(null);
     aoiRef.current = aoi;
     setJobState("");
@@ -649,10 +684,26 @@ export default function App() {
     // Start the run and hand tracking to the canonical run monitor (which
     // survives refresh). Throws synchronously if the project 404s.
     lastAnalyzeOptions.current = options;
-    const { run_id } = await api.startAnalysisRun(pid, options);
-    setActiveRun(null);
-    setActiveRunId(run_id); // effect begins polling the run immediately
-    setJobState("running:queued");
+    try {
+      const { run_id } = await api.startAnalysisRun(pid, options);
+      setActiveRun(null);
+      setActiveRunId(run_id); // effect begins polling the run immediately
+      setJobState("running:queued");
+    } catch (err) {
+      // 409: an analysis is already live for this project — attach to it
+      // instead of duplicating the work.
+      const conflict =
+        err instanceof api.ApiError && err.status === 409
+          ? (err.detail as { active_run_id?: string })
+          : null;
+      if (conflict?.active_run_id) {
+        setActiveRun(null);
+        setActiveRunId(conflict.active_run_id);
+        setJobState("running:attached to the analysis already in progress");
+        return;
+      }
+      throw err;
+    }
   };
 
   /** Resolve the analysis area. For a DTM run it is the DTM footprint unless
@@ -1118,8 +1169,25 @@ export default function App() {
   };
 
   const retryActiveRun = async () => {
-    // Re-run terrain analysis with the same DTM/AOI after a failure or a
-    // confirmed stall — reusing the exact options of the failed run.
+    // Prefer the server-side retry: it re-validates the DTM, copies the
+    // failed run's exact stored parameters (surviving refresh, unlike the
+    // in-memory options), and links the new run via retry_of.
+    if (projectId && activeRunId && activeRun &&
+        (["failed", "cancelled"].includes(activeRun.state) ||
+         ["worker_missing", "possibly_stalled"].includes(activeRun.health))) {
+      try {
+        const { run_id } = await api.retryAnalysisRun(projectId, activeRunId);
+        setActiveRun(null);
+        setActiveRunId(run_id);
+        setJobState("running:queued");
+        setBusy(true);
+        return;
+      } catch (err) {
+        setJobState(`error:${(err as Error).message}`);
+        return;
+      }
+    }
+    // no retryable server-side run (e.g. stale local state): start fresh
     const opts = lastAnalyzeOptions.current;
     if (opts) {
       await analyze(opts);
@@ -1182,6 +1250,28 @@ export default function App() {
     // the file into React memory.
     window.open(api.runDownloadUrl(projectId, downloadRun.id, product), "_blank");
   };
+
+  // Registered artifacts for the download run (size/created/verified
+  // availability from the registry — the source of truth for downloads).
+  const downloadRunId = downloadRun?.id ?? null;
+  useEffect(() => {
+    if (!projectId || !downloadRunId) {
+      setArtifacts([]);
+      return;
+    }
+    let cancelled = false;
+    api
+      .listArtifacts(projectId, downloadRunId)
+      .then((items) => {
+        if (!cancelled) setArtifacts(items);
+      })
+      .catch(() => {
+        if (!cancelled) setArtifacts([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, downloadRunId]);
 
   return (
     <div className="app">
@@ -1471,8 +1561,13 @@ export default function App() {
             <div className="downloads-title">Downloads</div>
             <button
               className="dl-btn"
+              disabled={!downloadRun.exports.original_dtm}
               onClick={() => openDownload("dtm")}
-              title="Untouched elevation raster used for analysis."
+              title={
+                downloadRun.exports.original_dtm
+                  ? "Untouched elevation raster used for analysis."
+                  : "The source DTM file is not available on the server."
+              }
             >
               Original DTM
             </button>
@@ -1502,8 +1597,13 @@ export default function App() {
             </button>
             <button
               className="dl-btn"
+              disabled={!downloadRun.exports.visual_geotiff}
               onClick={() => openDownload("keyline-design-map.tif")}
-              title="Visual georeferenced map. This is NOT an elevation raster."
+              title={
+                downloadRun.exports.visual_geotiff
+                  ? "Visual georeferenced map. This is NOT an elevation raster."
+                  : "The visual map could not be generated for this run."
+              }
             >
               {downloadRun.exports.keylines_geojson
                 ? "DTM + keylines map"
@@ -1511,6 +1611,7 @@ export default function App() {
             </button>
             <button
               className="dl-btn dl-primary"
+              disabled={!downloadRun.exports.design_bundle}
               onClick={() => openDownload("design-package.zip")}
               title="All terrain, vector, QA, and metadata outputs."
             >
@@ -1520,6 +1621,39 @@ export default function App() {
               <div className="muted dl-note">
                 No valid keyline was generated — the design map is a diagnostic
                 terrain map, and keyline-only files are unavailable.
+              </div>
+            )}
+            {artifacts.length > 0 && projectId && (
+              <div className="artifact-list" data-testid="artifact-list">
+                <div className="downloads-title">All generated files</div>
+                {artifacts.map((a) => (
+                  <div className="artifact-row" key={a.id}>
+                    {a.available ? (
+                      <a
+                        className="artifact-name"
+                        href={api.artifactDownloadUrl(projectId, a.id)}
+                        target="_blank"
+                        rel="noreferrer"
+                        title={a.description ?? a.artifact_type}
+                      >
+                        {a.filename ?? a.artifact_type}
+                      </a>
+                    ) : (
+                      <span
+                        className="artifact-name artifact-missing"
+                        title={a.unavailable_reason ?? "Unavailable"}
+                      >
+                        {a.filename ?? a.artifact_type} (unavailable)
+                      </span>
+                    )}
+                    <span className="muted artifact-meta">
+                      {fmtBytes(a.size_bytes)}
+                      {a.created_at
+                        ? ` · ${new Date(a.created_at * 1000).toLocaleString()}`
+                        : ""}
+                    </span>
+                  </div>
+                ))}
               </div>
             )}
           </div>

@@ -52,10 +52,16 @@ export default function AnalysisProgressPanel({
   const terminal = ["completed", "completed_with_warnings", "failed", "cancelled"].includes(
     run.state
   );
+  // A stalled run must always leave the user an action: Retry is offered as
+  // soon as the run is terminal-bad, the worker is provably gone, or the
+  // heartbeat verdict is possibly_stalled (retry marks a dead run WORKER_LOST
+  // server-side before starting the replacement; a run that is actually
+  // alive is refused with 409, so this can never duplicate live work).
   const failedOrStalled =
     run.state === "failed" ||
     run.state === "cancelled" ||
-    run.health === "worker_missing";
+    run.health === "worker_missing" ||
+    run.health === "possibly_stalled";
   const plan = run.stage_plan ?? [];
   const currentIdx = plan.indexOf(run.stage ?? "");
   const tone = HEALTH_TONE[run.health] ?? "ok";

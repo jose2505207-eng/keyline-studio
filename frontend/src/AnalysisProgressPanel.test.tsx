@@ -67,6 +67,10 @@ function makeRun(overrides: Partial<AnalysisRun> = {}): AnalysisRun {
     health: "active",
     health_message: null,
     cancellable: true,
+    retryable: false,
+    executor: "rq",
+    retry_of: null,
+    retry_count: 0,
     worker: { rq_job_id: "j1", status: "started", worker_name: "w1" },
     exports: {
       original_dtm: false,
@@ -153,6 +157,22 @@ describe("AnalysisProgressPanel", () => {
       screen.getByRole("button", { name: /Re-run terrain analysis/ })
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+  });
+
+  it("offers retry for a possibly-stalled run so the user is never stuck", () => {
+    render(
+      <AnalysisProgressPanel
+        run={makeRun({
+          health: "possibly_stalled",
+          seconds_since_heartbeat: 400,
+          cancellable: false,
+          health_message:
+            "No heartbeat for 6 minute(s). The worker job still exists and may be processing a slow terrain operation.",
+        })}
+        onRetry={() => {}}
+      />
+    );
+    expect(screen.getByRole("button", { name: /Retry analysis/ })).toBeTruthy();
   });
 
   it("shows the failure error message", () => {
