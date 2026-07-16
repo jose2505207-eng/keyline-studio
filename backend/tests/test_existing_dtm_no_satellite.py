@@ -78,6 +78,48 @@ def test_existing_dtm_partial_coverage_fetches_satellite_on_optin(tmp_path,
     assert called["n"] == 1  # satellite fetched — only because opt-in was set
 
 
+# --- high-res DTM is coarsened under the cell budget (the "Fusing DEM" hang) --
+def test_highres_dtm_coarsened_under_grid_budget(tmp_path, monkeypatch):
+    """A 0.1 m/px DTM over a whole AOI must not explode the analysis grid: the
+    hydrology/fusion grid stays under ANALYSIS_MAX_GRID_CELLS so a small worker
+    does not OOM/stall. Uses a tiny budget to force coarsening deterministically."""
+    import rasterio
+    from rasterio.transform import from_origin
+
+    monkeypatch.setenv("ANALYSIS_MAX_GRID_CELLS", "250000")
+    from app import config
+
+    budget = config.analysis_max_grid_cells()
+    assert budget == 250_000
+
+    # 900x900 @ 0.1 m = 810k native cells, well over the 250k budget
+    crs, ox, oy, res, n = "EPSG:32614", 600000.0, 3340000.0, 0.1, 900
+    y, x = __import__("numpy").mgrid[0:n, 0:n]
+    dem = (300 + 0.002 * x + 5 * __import__("numpy").sin(x / 80.0)).astype("float32")
+    dtm = str(tmp_path / "hi.tif")
+    with rasterio.open(dtm, "w", driver="GTiff", height=n, width=n, count=1,
+                       dtype="float32", crs=crs, nodata=-9999.0,
+                       transform=from_origin(ox, oy, res, res)) as d:
+        d.write(dem, 1)
+    from pyproj import Transformer
+    tr = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+    e0, e1, nn0, nn1 = ox + 10, ox + n * res - 10, oy - n * res + 10, oy - 10
+    ring = [tr.transform(e, nv) for e, nv in
+            [(e0, nn0), (e1, nn0), (e1, nn1), (e0, nn1), (e0, nn0)]]
+    aoi = {"type": "Polygon", "coordinates": [[list(c) for c in ring]]}
+
+    # full coverage -> drone_only; no satellite fetched
+    from app import dem_source, pipeline
+    monkeypatch.setattr(dem_source, "fetch_glo30", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("no satellite for a covering DTM")))
+    fc = pipeline.run_pipeline(str(tmp_path / "proj"), aoi, drone_path=dtm)
+    with rasterio.open(str(tmp_path / "proj" / "dem_utm.tif")) as s:
+        cells = s.width * s.height
+    assert fc["properties"]["dem_mode"] == "drone_only"
+    assert cells <= budget * 1.10, f"grid {cells} exceeds budget {budget}"
+    assert fc["properties"]["dem_resolution_m"] > 0.1  # coarsened from native
+
+
 # --- reporter: terrain_source is never overwritten by mode resolution ---------
 @pytest.fixture()
 def run_ctx(tmp_path, monkeypatch):

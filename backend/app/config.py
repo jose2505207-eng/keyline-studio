@@ -177,6 +177,18 @@ def analysis_stage_timeout_seconds() -> int:
     return _int("ANALYSIS_STAGE_TIMEOUT_SECONDS", 600)
 
 
+def analysis_max_grid_cells() -> int:
+    """Upper bound on the analysis-grid cell count. A high-resolution drone
+    DTM (e.g. 0.1 m/px) over a whole property is coarsened to keep the grid
+    under this budget before hydrology/fusion run — keyline contours do not
+    need sub-metre detail, and an unbounded grid OOMs/stalls a small worker
+    (the hang on "Fusing DEM"). Tune down on very constrained hosts."""
+    # 1.5M keeps peak hydrology memory well under a 512 MB free-tier worker
+    # while preserving ample keyline detail (analysis res ~0.15 m on a 0.1 m
+    # DTM over a house-lot-sized AOI).
+    return _int("ANALYSIS_MAX_GRID_CELLS", 1_500_000)
+
+
 # --- jobs ----------------------------------------------------------------------
 
 def redis_url() -> str:

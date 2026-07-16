@@ -28,7 +28,10 @@ from .hydrology import get_engine
 log = logging.getLogger(__name__)
 
 MAX_AOI_KM2 = 100.0
-MAX_GRID_CELLS = 25_000_000  # memory guard when running at drone resolution
+# Legacy constant kept for reference; the live budget comes from
+# config.analysis_max_grid_cells() (default 2M) so high-resolution drone DTMs
+# are coarsened before hydrology/fusion instead of exploding the grid.
+MAX_GRID_CELLS = 25_000_000
 BBOX_PAD_FRAC = 0.10  # pad fetch bbox ~10% to avoid edge artifacts in routing
 
 
@@ -568,9 +571,13 @@ def _prepare_drone_only_grid(drone_path: str, aoi_wgs, utm_crs: str,
                                       nodata=np.nan)
     native_res = abs(drone_utm.rio.transform().a)
     cells = drone_utm.sizes["x"] * drone_utm.sizes["y"]
-    if cells > MAX_GRID_CELLS:
-        target = native_res * float(np.sqrt(cells / MAX_GRID_CELLS))
-        progress(f"coarsening drone DTM to {target:.2f} m (memory guard)")
+    from . import config as _config
+
+    budget = _config.analysis_max_grid_cells()
+    if cells > budget:
+        target = native_res * float(np.sqrt(cells / budget))
+        progress(f"coarsening drone DTM {native_res:.2f}->{target:.2f} m "
+                 f"({cells/1e6:.1f}M cells over the {budget/1e6:.1f}M budget)")
         drone_utm = clipped.rio.reproject(utm_crs, resolution=target,
                                           resampling=Resampling.bilinear,
                                           nodata=np.nan)
@@ -705,10 +712,19 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
             drone_res = abs(drone_utm.rio.transform().a)
             sat_res = abs(sat_utm.rio.transform().a)
             # Single common grid at the finer resolution over the whole AOI,
-            # capped so the grid stays in memory.
-            target_res = max(drone_res, np.sqrt((sat_utm.sizes["x"] * sat_res) *
-                                                (sat_utm.sizes["y"] * sat_res) /
-                                                MAX_GRID_CELLS))
+            # capped so the fused grid (and the hydrology that follows) stays
+            # within the cell budget — a native 0.1 m drone DTM over a whole
+            # property must not explode into tens of millions of cells.
+            from . import config as _config
+
+            budget = _config.analysis_max_grid_cells()
+            extent_x_m = sat_utm.sizes["x"] * sat_res
+            extent_y_m = sat_utm.sizes["y"] * sat_res
+            res_for_budget = np.sqrt(extent_x_m * extent_y_m / budget)
+            target_res = max(drone_res, res_for_budget)
+            if target_res > drone_res:
+                op(f"limiting fused grid to {budget/1e6:.1f}M cells "
+                   f"(analysis resolution {target_res:.2f} m)")
             if target_res < sat_res:
                 op(f"resampling satellite base to {target_res:.2f} m")
                 base = sat_utm.rio.reproject(utm_crs, resolution=target_res,

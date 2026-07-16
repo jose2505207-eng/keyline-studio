@@ -39,3 +39,8 @@ services:
         sync: false
       - key: DRONE_MIN_IMAGES
         sync: false # dashboard-tunable; backend default is 20
+      # Cap the hydrology/fusion grid so a high-resolution (0.1 m) drone DTM
+      # over a whole property is coarsened instead of OOM/stalling the 512 MB
+      # free-tier worker (the "Fusing DEM" hang). 1.2M is conservative here.
+      - key: ANALYSIS_MAX_GRID_CELLS
+        value: "1200000"
