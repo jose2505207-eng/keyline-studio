@@ -85,7 +85,7 @@ describe("DtmPanel", () => {
     await user.selectOptions(screen.getByLabelText("Saved DTMs"), "dtm_abc123");
     expect(analyze).toBeEnabled();
     await user.click(analyze);
-    expect(onAnalyze).toHaveBeenCalledWith("dtm_abc123", {});
+    expect(onAnalyze).toHaveBeenCalledWith("dtm_abc123", {}, false);
   });
 
   it("upload button opens the hidden file input", async () => {
@@ -278,8 +278,10 @@ describe("DtmPanel locate flow", () => {
     await user.selectOptions(screen.getByLabelText("Saved DTMs"), "dtm_abc123");
     await user.click(
       screen.getByRole("button", { name: /Analyze with selected DTM/ }));
-    expect(onAnalyze).toHaveBeenCalledWith("dtm_abc123", {
-      contour_interval_m: 2.5,
-    });
+    expect(onAnalyze).toHaveBeenCalledWith(
+      "dtm_abc123",
+      { contour_interval_m: 2.5 },
+      false
+    );
   });
 });

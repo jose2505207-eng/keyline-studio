@@ -297,6 +297,25 @@ def run_cancel_requested(rid: str) -> bool:
     return bool(row and row["cancel_requested"])
 
 
+def claim_analysis_run(rid: str, worker: str, stale_after: float = 120.0) -> bool:
+    """Atomically claim a run for one worker so a duplicate worker cannot
+    process the same job. Succeeds only when the run is unclaimed, already
+    claimed by this same worker, or the previous claim has gone stale (its
+    heartbeat is older than ``stale_after`` — the prior worker died). Returns
+    True on success."""
+    now = time.time()
+    cutoff = now - stale_after
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE analysis_runs SET claimed_by=?, claimed_at=? "
+            "WHERE id=? AND ("
+            "  claimed_by IS NULL OR claimed_by=? "
+            "  OR state IN ('completed','completed_with_warnings','failed','cancelled') "
+            "  OR COALESCE(heartbeat_at, claimed_at, 0) < ?)",
+            (worker, now, rid, worker, cutoff))
+        return cur.rowcount > 0
+
+
 # ---------------------------------------------------------------------------
 # DTM library
 

@@ -38,7 +38,11 @@ interface Props {
    * the app flies the map there and may adopt the footprint as the AOI. */
   onLocate: (dtm: api.Dtm) => void;
   onDtmSelected?: (id: string | null) => void;
-  onAnalyze: (dtmId: string, terrain: TerrainParams) => void;
+  onAnalyze: (
+    dtmId: string,
+    terrain: TerrainParams,
+    fillMissingAreasWithSatellite: boolean
+  ) => void;
 }
 
 export default function DtmPanel({
@@ -59,6 +63,7 @@ export default function DtmPanel({
   const [detail, setDetail] = useState<api.Dtm | null>(null);
   const [paramsOpen, setParamsOpen] = useState(false);
   const [terrain, setTerrain] = useState<Record<string, string>>({});
+  const [fillSat, setFillSat] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const refresh = useCallback(async () => {
@@ -369,11 +374,25 @@ export default function DtmPanel({
         </div>
       )}
 
+      <label className="dtm-fillsat" title="When the DTM does not fully cover the analysis area, fetch Copernicus GLO-30 to fill the gaps and fuse. Off by default — an existing DTM is analyzed on its own.">
+        <input
+          type="checkbox"
+          checked={fillSat}
+          onChange={(e) => setFillSat(e.target.checked)}
+        />
+        <span>
+          Fill gaps outside the DTM with satellite elevation (fetches
+          Copernicus)
+        </span>
+      </label>
+
       <button
         type="button"
         className="primary"
         disabled={disabledReason !== null}
-        onClick={() => selected && onAnalyze(selected.id, parseTerrain())}
+        onClick={() =>
+          selected && onAnalyze(selected.id, parseTerrain(), fillSat)
+        }
       >
         ▶ Analyze with selected DTM
       </button>

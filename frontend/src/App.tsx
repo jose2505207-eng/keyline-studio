@@ -136,6 +136,12 @@ export default function App() {
   const [activeRun, setActiveRun] = useState<api.AnalysisRun | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
   activeRunIdRef.current = activeRunId;
+  const lastAnalyzeOptions = useRef<{
+    dtmId?: string;
+    demMode?: string;
+    terrain?: Record<string, number>;
+    fillMissingAreasWithSatellite?: boolean;
+  } | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
   const [mapMeta, setMapMeta] = useState<api.MapMeta | null>(null);
   const [scanOverlay, setScanOverlay] = useState<{
@@ -633,10 +639,16 @@ export default function App() {
    * synchronously if the project 404s (caller recreates + retries). */
   const runAnalysisOn = async (
     pid: string,
-    options: { dtmId?: string; demMode?: string; terrain?: Record<string, number> }
+    options: {
+      dtmId?: string;
+      demMode?: string;
+      terrain?: Record<string, number>;
+      fillMissingAreasWithSatellite?: boolean;
+    }
   ) => {
     // Start the run and hand tracking to the canonical run monitor (which
     // survives refresh). Throws synchronously if the project 404s.
+    lastAnalyzeOptions.current = options;
     const { run_id } = await api.startAnalysisRun(pid, options);
     setActiveRun(null);
     setActiveRunId(run_id); // effect begins polling the run immediately
@@ -698,7 +710,12 @@ export default function App() {
   };
 
   const analyze = async (
-    options: { dtmId?: string; demMode?: string; terrain?: Record<string, number> } = {}
+    options: {
+      dtmId?: string;
+      demMode?: string;
+      terrain?: Record<string, number>;
+      fillMissingAreasWithSatellite?: boolean;
+    } = {}
   ) => {
     const aoi = resolveAoi(Boolean(options.dtmId));
     if (!aoi) {
@@ -1102,8 +1119,20 @@ export default function App() {
 
   const retryActiveRun = async () => {
     // Re-run terrain analysis with the same DTM/AOI after a failure or a
-    // confirmed stall.
-    await rerunAnalysis();
+    // confirmed stall — reusing the exact options of the failed run.
+    const opts = lastAnalyzeOptions.current;
+    if (opts) {
+      await analyze(opts);
+    } else {
+      await rerunAnalysis();
+    }
+  };
+
+  /** After a DTM_COVERAGE_INSUFFICIENT stop, let the user explicitly opt in to
+   * satellite gap-filling and retry — the only path that fetches Copernicus. */
+  const retryWithSatelliteFill = async () => {
+    const opts = lastAnalyzeOptions.current ?? {};
+    await analyze({ ...opts, fillMissingAreasWithSatellite: true });
   };
   useEffect(() => stopRerunPolling, []);
 
@@ -1327,8 +1356,12 @@ export default function App() {
             }
             onLocate={(dtm) => void locateDtm(dtm)}
             onDtmSelected={setDtmId}
-            onAnalyze={(id, terrain) =>
-              void analyze({ dtmId: id, terrain: terrain as Record<string, number> })}
+            onAnalyze={(id, terrain, fillSat) =>
+              void analyze({
+                dtmId: id,
+                terrain: terrain as Record<string, number>,
+                fillMissingAreasWithSatellite: fillSat,
+              })}
           />
         )}
 
@@ -1419,6 +1452,18 @@ export default function App() {
             onRetry={retryActiveRun}
             onRerun={rerunAnalysis}
           />
+        )}
+
+        {activeRun?.error_code === "DTM_COVERAGE_INSUFFICIENT" && (
+          <div className="coverage-retry">
+            <button className="dl-btn dl-primary" onClick={retryWithSatelliteFill}>
+              Fill gaps with satellite &amp; retry
+            </button>
+            <div className="muted dl-note">
+              This is the only action that fetches Copernicus satellite
+              elevation for this DTM.
+            </div>
+          </div>
         )}
 
         {downloadRun && (

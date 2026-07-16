@@ -16,7 +16,11 @@ import time
 from typing import Callable
 
 from .. import config, db
-from ..pipeline import params_from_dict, run_pipeline
+from ..pipeline import (
+    InsufficientCoverageError,
+    params_from_dict,
+    run_pipeline,
+)
 
 log = logging.getLogger(__name__)
 
@@ -70,11 +74,25 @@ def execute_analysis_run(run_id: str,
     out_dir = run_output_dir(project["id"], run_id)
     project_dir = os.path.join(data_dir(), project["id"])
     dem_path = run.get("dem_path")
+    rq_job_id = _current_rq_job_id()
+
+    # Duplicate-worker guard: only one worker may execute a given run. A stale
+    # claim (dead worker, no recent heartbeat) can be taken over.
+    import socket
+
+    worker_token = rq_job_id or f"{socket.gethostname()}:{os.getpid()}"
+    if not db.claim_analysis_run(run_id, worker_token):
+        lg.warning("analysis run %s already claimed by another worker — "
+                   "skipping duplicate execution", run_id)
+        return db.get_analysis_run(run_id) or {}
 
     reporter = prog.ProgressReporter(
         run_id, dem_mode=params.get("dem_mode", "auto"),
-        rq_job_id=_current_rq_job_id(), extra_progress=extra_progress)
-    db.update_analysis_run(run_id, result_dir=out_dir)
+        rq_job_id=rq_job_id, extra_progress=extra_progress,
+        terrain_source=params.get("terrain_source"))
+    db.update_analysis_run(run_id, result_dir=out_dir,
+                           fill_missing_with_satellite=int(bool(
+                               params.get("fill_missing_areas_with_satellite"))))
     reporter.start()
     try:
         reporter.start_stage(prog.LOADING_PROJECT, "loading project + AOI")
@@ -100,6 +118,8 @@ def execute_analysis_run(run_id: str,
             analysis_run_id=run_id,
             gcp_supplied=gcp_supplied,
             satellite_qa=config._bool("QA_SATELLITE_CROSSCHECK", True),
+            fill_missing_areas_with_satellite=bool(
+                params.get("fill_missing_areas_with_satellite")),
             reporter=reporter,
         )
 
@@ -142,7 +162,18 @@ def execute_analysis_run(run_id: str,
                                error_code="CANCELLED",
                                error_message="Analysis was cancelled.",
                                completed_at=time.time())
+        _cleanup_temp_files(out_dir)
         lg.info("analysis run cancelled")
+        raise
+    except InsufficientCoverageError as exc:
+        # Honest, actionable failure — never a silent satellite fallback.
+        lg.info("analysis run stopped: DTM coverage %.1f%% insufficient",
+                exc.coverage * 100)
+        cur = db.get_analysis_run(run_id) or {}
+        if cur.get("state") not in prog.TERMINAL_STATES:
+            reporter.fail(exc.code, str(exc))
+            db.update_analysis_run(run_id, completed_at=time.time())
+        _cleanup_temp_files(out_dir)
         raise
     except Exception as exc:
         lg.exception("analysis run failed")
@@ -150,9 +181,26 @@ def execute_analysis_run(run_id: str,
         if cur.get("state") not in prog.TERMINAL_STATES:
             reporter.fail("ANALYSIS_FAILED", str(exc))
             db.update_analysis_run(run_id, completed_at=time.time())
+        _cleanup_temp_files(out_dir)
         raise
     finally:
         reporter.close()
+
+
+def _cleanup_temp_files(out_dir: str) -> None:
+    """Remove partial/temporary artifacts from an aborted run (atomic writers
+    leave *.tmp behind only if killed mid-write)."""
+    import glob
+
+    try:
+        for pattern in ("*.tmp", "*.zip.tmp", "**/*.tmp"):
+            for p in glob.glob(os.path.join(out_dir, pattern), recursive=True):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+    except Exception:  # noqa: BLE001 — cleanup is best-effort
+        pass
 
 
 def run_analysis_job(run_id: str) -> None:
@@ -175,8 +223,15 @@ def run_terrain_for_survey(survey_id: str) -> dict:
 
     # register the DTM on the project so re-analysis from the UI reuses it
     db.set_drone_path(project["id"], dtm)
-    run_id = db.create_analysis_run(project["id"], survey_id, dtm,
-                                    {"trigger": "survey", "dem_mode": "auto"})
+    # A drone survey may opt in to satellite gap-filling via its options; the
+    # provenance is the drone DTM regardless of the resolved engine mode.
+    options = survey.get("options_json") or {}
+    run_id = db.create_analysis_run(
+        project["id"], survey_id, dtm,
+        {"trigger": "survey", "dem_mode": "auto",
+         "terrain_source": "drone_only",
+         "fill_missing_areas_with_satellite":
+             bool(options.get("fill_missing_areas_with_satellite"))})
 
     def survey_stage(step: str) -> None:
         db.update_survey(survey_id, stage=f"keyline analysis: {step}")

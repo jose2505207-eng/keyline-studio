@@ -45,6 +45,24 @@ def _add_analysis_progress_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE analysis_runs ADD COLUMN {name} {decl}")
 
 
+def _add_stage_progress_columns(conn: sqlite3.Connection) -> None:
+    """Migration 5: per-stage timing + a worker claim for stall detection and
+    duplicate-worker prevention. Additive and idempotent."""
+    existing = {row[1] for row in
+                conn.execute("PRAGMA table_info(analysis_runs)").fetchall()}
+    columns = [
+        ("stage_started_at", "REAL"),
+        ("last_progress_at", "REAL"),
+        ("current_operation", "TEXT"),
+        ("fill_missing_with_satellite", "INTEGER NOT NULL DEFAULT 0"),
+        ("claimed_by", "TEXT"),
+        ("claimed_at", "REAL"),
+    ]
+    for name, decl in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE analysis_runs ADD COLUMN {name} {decl}")
+
+
 MIGRATIONS: list[tuple[int, Union[str, Callable[[sqlite3.Connection], None]]]] = [
     (
         1,
@@ -131,6 +149,7 @@ MIGRATIONS: list[tuple[int, Union[str, Callable[[sqlite3.Connection], None]]]] =
         """,
     ),
     (4, _add_analysis_progress_columns),
+    (5, _add_stage_progress_columns),
 ]
 
 

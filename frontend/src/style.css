@@ -905,3 +905,14 @@ body,
 }
 .dl-primary:hover:not(:disabled) { background: #245cbb; }
 .dl-note { font-size: 11px; }
+
+.dtm-fillsat {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+  margin: 6px 0;
+  cursor: pointer;
+}
+.dtm-fillsat input { margin-top: 2px; }
+.coverage-retry { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }

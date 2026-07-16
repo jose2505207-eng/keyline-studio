@@ -487,13 +487,35 @@ def _write_outputs(out_dir: str, dem_da: xr.DataArray, result: TerrainResult,
     return fc
 
 
+class InsufficientCoverageError(ValueError):
+    """The selected DTM does not cover enough of the AOI and the user did not
+    opt in to satellite gap-filling. Never silently fall back to satellite."""
+
+    code = "DTM_COVERAGE_INSUFFICIENT"
+
+    def __init__(self, coverage: float, threshold: float):
+        self.coverage = coverage
+        self.threshold = threshold
+        super().__init__(
+            f"The selected DTM covers only {coverage * 100:.1f}% of the "
+            f"analysis area (at least {threshold * 100:.0f}% is required for a "
+            "DTM-only analysis). Draw the area within the DTM footprint, or "
+            "enable 'fill gaps with satellite elevation' to complete the "
+            "missing areas with Copernicus GLO-30.")
+
+
 def select_dem_mode(drone_path: str | None, aoi_geojson: dict,
-                    requested: str = "auto") -> tuple[str, float | None]:
+                    requested: str = "auto", *,
+                    fill_missing_areas_with_satellite: bool = False
+                    ) -> tuple[str, float | None]:
     """Pick satellite_only | drone_only | fused and report drone coverage.
 
-    A drone DTM covering at least DRONE_ONLY_MIN_AOI_COVERAGE of the AOI is
-    analyzed alone — Copernicus is not fetched just to be upsampled beneath
-    a complete high-resolution DTM. Partial coverage falls back to fusion.
+    A DTM covering at least DRONE_ONLY_MIN_AOI_COVERAGE of the AOI is analyzed
+    alone — Copernicus is never fetched to sit beneath a complete DTM. For a
+    partially-covering DTM in ``auto`` mode, satellite fusion is used **only**
+    when the caller explicitly set ``fill_missing_areas_with_satellite``;
+    otherwise this raises :class:`InsufficientCoverageError` with the coverage
+    percentage. Existing-DTM analysis must never silently invoke satellite.
     """
     if requested not in ("auto", "satellite_only", "drone_only", "fused"):
         raise ValueError(f"Unknown dem_mode {requested!r}")
@@ -504,13 +526,24 @@ def select_dem_mode(drone_path: str | None, aoi_geojson: dict,
     from .assets import dtm_aoi_coverage
 
     coverage = dtm_aoi_coverage(drone_path, aoi_geojson)
-    if requested != "auto":
-        return requested, coverage
+    # Explicit modes are honoured verbatim (fused is itself an explicit opt-in
+    # to satellite); only the default 'auto' path is coverage-driven.
+    if requested == "satellite_only":
+        return "satellite_only", coverage
+    if requested == "drone_only":
+        return "drone_only", coverage
+    if requested == "fused":
+        return "fused", coverage
+
     from . import config as _config
 
-    if coverage >= _config.drone_only_min_aoi_coverage():
+    threshold = _config.drone_only_min_aoi_coverage()
+    if coverage >= threshold:
         return "drone_only", coverage
-    return "fused", coverage
+    # Partial coverage in auto mode — never fuse silently.
+    if fill_missing_areas_with_satellite:
+        return "fused", coverage
+    raise InsufficientCoverageError(coverage, threshold)
 
 
 def _prepare_drone_only_grid(drone_path: str, aoi_wgs, utm_crs: str,
@@ -554,6 +587,7 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
                  analysis_run_id: str | None = None,
                  gcp_supplied: bool = False,
                  satellite_qa: bool = False,
+                 fill_missing_areas_with_satellite: bool = False,
                  reporter=None) -> dict:
     """Full pipeline for a project. Returns the result FeatureCollection.
 
@@ -588,9 +622,13 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
         stage(prog.COMPUTING_DRONE_COVERAGE, "computing drone DTM coverage")
     else:
         stage(prog.SELECTING_DEM_MODE, "selecting DEM mode")
-    dem_mode, drone_coverage = select_dem_mode(drone_path, aoi_geojson, dem_mode)
+    dem_mode, drone_coverage = select_dem_mode(
+        drone_path, aoi_geojson, dem_mode,
+        fill_missing_areas_with_satellite=fill_missing_areas_with_satellite)
     if reporter is not None:
-        reporter.set_mode(dem_mode, terrain_source=dem_mode)
+        # preserve the user-selected provenance (terrain_source); only the
+        # engine mode changes here
+        reporter.set_mode(dem_mode)
 
     from rasterio.enums import Resampling
 
@@ -616,16 +654,26 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
             np.asarray(clip_values, dtype="float32"), has_drone=True,
             params=params)
     else:
+        def op(msg: str, pct: float | None = None) -> None:
+            if reporter is not None:
+                reporter.operation(msg, pct)
+            else:
+                progress(msg)
+
         # --- fetch (padded bbox)
         stage(prog.FETCHING_SATELLITE_DEM, "fetching Copernicus GLO-30 elevation")
         w, s, e, n = aoi.bounds
         pw, ph = (e - w) * BBOX_PAD_FRAC, (n - s) * BBOX_PAD_FRAC
+        op("contacting Copernicus GLO-30 tile store")
         sat = dem_source.fetch_glo30(w - pw, s - ph, e + pw, n + ph)
+        op("Copernicus GLO-30 window downloaded")
 
         # --- reproject to local UTM
         stage(prog.REPROJECTING_SATELLITE_DEM, f"reprojecting to {utm_crs}")
+        op(f"reprojecting satellite DEM to {utm_crs}")
         sat_utm = sat.rio.reproject(utm_crs, resampling=Resampling.bilinear)
         sat_utm = sat_utm.where(np.abs(sat_utm) < 1e10)
+        op("satellite DEM reprojected")
 
         # --- honest data-quality guard, on the raw (unsmoothed) satellite DEM
         stage(prog.TERRAIN_QUALITY_CHECKS,
@@ -651,6 +699,7 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
         dem_da = sat_utm
         if dem_mode == "fused":
             stage(prog.FUSING_DEM, "fusing drone DEM with satellite base")
+            op("loading + reprojecting drone DEM for fusion")
             drone = rioxarray.open_rasterio(drone_path, masked=True).squeeze("band", drop=True)
             drone_utm = drone.rio.reproject(utm_crs, resampling=Resampling.bilinear)
             drone_res = abs(drone_utm.rio.transform().a)
@@ -661,16 +710,20 @@ def run_pipeline(project_dir: str, aoi_geojson: dict,
                                                 (sat_utm.sizes["y"] * sat_res) /
                                                 MAX_GRID_CELLS))
             if target_res < sat_res:
+                op(f"resampling satellite base to {target_res:.2f} m")
                 base = sat_utm.rio.reproject(utm_crs, resolution=target_res,
                                              resampling=Resampling.bilinear)
                 base = base.where(np.abs(base) < 1e10)
             else:
                 base = sat_utm
+            op("resampling drone DEM onto the common grid")
             drone_arr = fusion.reproject_drone_to_grid(drone_utm, base)
+            op("blending drone + satellite elevation")
             fused, drone_weight = fusion.fuse(
                 base.values.astype("float32"), drone_arr,
                 cell_size=abs(base.rio.transform().a))
             dem_da = base.copy(data=fused)
+            op("fusion complete")
 
         dem = dem_da.values.astype("float32")
         if np.isnan(dem).all():

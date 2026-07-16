@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.pipeline import select_dem_mode
+from app.pipeline import InsufficientCoverageError, select_dem_mode
 from fake_provider import write_synthetic_dtm
 from survey_helpers import aoi_inside_fake_dtm
 
@@ -20,11 +20,23 @@ def test_drone_only_selected_at_full_coverage(tmp_path):
     assert cov > 0.98
 
 
-def test_fused_selected_at_partial_coverage(tmp_path):
-    # DTM covering only the western half of the AOI footprint
+def test_partial_coverage_auto_refuses_silent_fusion(tmp_path):
+    # DTM covering only part of the AOI footprint: auto mode must NOT silently
+    # fetch satellite / fuse — it stops with an actionable coverage error.
     dtm = str(tmp_path / "half.tif")
     write_synthetic_dtm(dtm, size=(120, 55), nodata_corner=False)
-    mode, cov = select_dem_mode(dtm, aoi_inside_fake_dtm(), "auto")
+    with pytest.raises(InsufficientCoverageError) as ei:
+        select_dem_mode(dtm, aoi_inside_fake_dtm(), "auto")
+    assert 0.1 < ei.value.coverage < 0.9
+    assert "%" in str(ei.value)  # coverage percentage is surfaced
+
+
+def test_partial_coverage_fuses_only_with_explicit_optin(tmp_path):
+    dtm = str(tmp_path / "half.tif")
+    write_synthetic_dtm(dtm, size=(120, 55), nodata_corner=False)
+    mode, cov = select_dem_mode(
+        dtm, aoi_inside_fake_dtm(), "auto",
+        fill_missing_areas_with_satellite=True)
     assert mode == "fused"
     assert 0.1 < cov < 0.9
 

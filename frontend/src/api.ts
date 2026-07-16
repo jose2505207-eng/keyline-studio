@@ -530,8 +530,10 @@ export interface AnalysisRun {
   stage_plan: string[];
   progress_percent: number;
   current_message: string | null;
+  current_operation: string | null;
   dem_mode: string | null;
   terrain_source: string | null;
+  fill_missing_areas_with_satellite: boolean;
   analysis_version: string | null;
   has_dem: boolean;
   params: Record<string, unknown>;
@@ -543,12 +545,17 @@ export interface AnalysisRun {
   error_code: string | null;
   error_message: string | null;
   started_at: number | null;
+  stage_started_at: number | null;
   heartbeat_at: number | null;
+  last_heartbeat: number | null;
+  last_progress_at: number | null;
   updated_at: number | null;
   created_at: number;
   completed_at: number | null;
   elapsed_seconds: number | null;
+  stage_elapsed_seconds: number | null;
   seconds_since_heartbeat: number | null;
+  seconds_since_progress: number | null;
   health: string; // active|slow|possibly_stalled|worker_missing|failed|complete
   health_message: string | null;
   cancellable: boolean;
@@ -599,7 +606,12 @@ export function stageLabel(stage: string | null | undefined): string {
 
 export async function reanalyze(
   projectId: string,
-  opts: { surveyId?: string | null; dtmId?: string | null; demMode?: string } = {}
+  opts: {
+    surveyId?: string | null;
+    dtmId?: string | null;
+    demMode?: string;
+    fillMissingAreasWithSatellite?: boolean;
+  } = {}
 ): Promise<{ run_id: string; state: string }> {
   const res = await fetch(url(`/api/projects/${projectId}/reanalyze`), {
     method: "POST",
@@ -608,6 +620,8 @@ export async function reanalyze(
       survey_id: opts.surveyId ?? null,
       dtm_id: opts.dtmId ?? null,
       dem_mode: opts.demMode ?? "auto",
+      fill_missing_areas_with_satellite:
+        opts.fillMissingAreasWithSatellite ?? false,
     }),
   });
   return jsonOrThrow(res);
@@ -617,7 +631,12 @@ export async function reanalyze(
  * progress monitor polls). */
 export async function startAnalysisRun(
   projectId: string,
-  options: { dtmId?: string; demMode?: string; terrain?: Record<string, number> } = {}
+  options: {
+    dtmId?: string;
+    demMode?: string;
+    terrain?: Record<string, number>;
+    fillMissingAreasWithSatellite?: boolean;
+  } = {}
 ): Promise<{ job_id: string; run_id: string }> {
   const res = await fetch(url(`/api/projects/${projectId}/analyze`), {
     method: "POST",
@@ -626,6 +645,8 @@ export async function startAnalysisRun(
       dtm_id: options.dtmId ?? null,
       dem_mode: options.demMode ?? "auto",
       terrain: options.terrain ?? null,
+      fill_missing_areas_with_satellite:
+        options.fillMissingAreasWithSatellite ?? false,
     }),
   });
   return jsonOrThrow(res);

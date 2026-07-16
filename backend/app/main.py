@@ -230,10 +230,24 @@ def _run_job(jid: str, rid: str):
         db.update_job(jid, f"error:internal error: {exc}", log_line=str(exc))
 
 
+def _terrain_source_for(dtm: dict | None, dem_path: str | None) -> str:
+    """Provenance label recorded on the run — the single authoritative source
+    the worker/reporter must never overwrite. A library DTM from an upload/
+    import is an *existing_dtm*; one produced by a drone survey is drone_only;
+    with no DTM at all the analysis is satellite_only."""
+    if dtm is not None:
+        return "drone_only" if dtm.get("source_type") == "survey" \
+            else "existing_dtm"
+    return "drone_only" if dem_path else "satellite_only"
+
+
 class AnalyzeIn(BaseModel):
     dtm_id: str | None = None
     dem_mode: str = "auto"
     terrain: dict | None = None  # advanced terrain parameters (whitelisted)
+    # Existing-DTM analysis never touches Copernicus unless this is explicitly
+    # enabled; a partially-covering DTM otherwise stops with a coverage error.
+    fill_missing_areas_with_satellite: bool = False
 
 
 @app.post("/api/projects/{pid}/analyze")
@@ -246,14 +260,16 @@ def analyze(pid: str, background: BackgroundTasks,
     body = body or AnalyzeIn()
 
     survey_id = None
+    dtm = None
     if body.dtm_id:
         from .dtm_api import resolve_dtm_for_analysis
 
         dtm, dem_path = resolve_dtm_for_analysis(body.dtm_id)
         survey_id = dtm.get("survey_id")
         db.set_drone_path(pid, dem_path)  # keypoint-move + legacy reuse
-        log.info("analyze project=%s dtm_id=%s dtm_path=%s survey=%s mode=%s",
-                 pid, body.dtm_id, dem_path, survey_id, body.dem_mode)
+        log.info("analyze project=%s dtm_id=%s dtm_path=%s survey=%s mode=%s "
+                 "fill_sat=%s", pid, body.dtm_id, dem_path, survey_id,
+                 body.dem_mode, body.fill_missing_areas_with_satellite)
     else:
         dem_path = proj.get("drone_path")
         if dem_path and not os.path.isfile(dem_path):
@@ -263,12 +279,16 @@ def analyze(pid: str, background: BackgroundTasks,
                 422, f"dem_mode={body.dem_mode} requires a DTM — select or "
                      "upload one first")
 
+    terrain_source = _terrain_source_for(dtm, dem_path)
     jid = db.create_job(pid)
     rid = db.create_analysis_run(pid, survey_id, dem_path,
                                  {"trigger": "analyze",
                                   "dem_mode": body.dem_mode,
                                   "dtm_id": body.dtm_id,
-                                  "terrain": body.terrain})
+                                  "terrain": body.terrain,
+                                  "terrain_source": terrain_source,
+                                  "fill_missing_areas_with_satellite":
+                                      body.fill_missing_areas_with_satellite})
     background.add_task(_run_job, jid, rid)
     return {"job_id": jid, "run_id": rid}
 
@@ -336,6 +356,7 @@ class ReanalyzeIn(BaseModel):
     dtm_id: str | None = None      # pick a library DTM (preferred)
     dem_mode: str = "auto"
     terrain: dict | None = None    # advanced terrain parameters (whitelisted)
+    fill_missing_areas_with_satellite: bool = False
 
 
 @app.post("/api/projects/{pid}/reanalyze")
@@ -346,6 +367,7 @@ def reanalyze(pid: str, body: ReanalyzeIn):
     proj = _require_project(pid)
 
     dem_path = None
+    dtm = None
     survey_id = body.survey_id
     if body.dtm_id:
         from .dtm_api import resolve_dtm_for_analysis
@@ -373,11 +395,26 @@ def reanalyze(pid: str, body: ReanalyzeIn):
         raise HTTPException(422, f"dem_mode={body.dem_mode} requires a drone "
                                  "DTM, and this project has none")
 
+    # Preserve terrain_source across reanalysis: derive it from the chosen DTM
+    # when one is specified, else inherit the most recent run's provenance so a
+    # plain "re-run" never silently changes the source.
+    if dtm is not None:
+        terrain_source = _terrain_source_for(dtm, dem_path)
+    elif survey_id:
+        terrain_source = "drone_only"
+    else:
+        prev = next((r.get("terrain_source") for r in db.list_analysis_runs(pid)
+                     if r.get("terrain_source")), None)
+        terrain_source = prev or _terrain_source_for(None, dem_path)
+
     rid = db.create_analysis_run(pid, survey_id, dem_path,
                                  {"trigger": "reanalyze",
                                   "dem_mode": body.dem_mode,
                                   "dtm_id": body.dtm_id,
-                                  "terrain": body.terrain})
+                                  "terrain": body.terrain,
+                                  "terrain_source": terrain_source,
+                                  "fill_missing_areas_with_satellite":
+                                      body.fill_missing_areas_with_satellite})
     from .jobs import QueueUnavailable, get_queue
 
     try:
@@ -447,8 +484,13 @@ def _run_out(run: dict, *, full: bool = False) -> dict:
     now = __import__("time").time()
     started = run.get("started_at") or run.get("created_at")
     hb = run.get("heartbeat_at")
+    last_prog = run.get("last_progress_at")
     elapsed = int((run.get("completed_at") or now) - started) if started else None
     since_hb = int(now - hb) if hb else None
+    since_prog = int(now - last_prog) if last_prog else None
+    stage_started = run.get("stage_started_at")
+    stage_elapsed = int((run.get("completed_at") or now) - stage_started) \
+        if stage_started else None
     worker_status = _rq_job_status(run.get("rq_job_id"))
     health = prog.classify_health(run, worker_status=worker_status, now=now)
     out = {
@@ -461,8 +503,12 @@ def _run_out(run: dict, *, full: bool = False) -> dict:
         "stage_plan": run.get("stage_plan_json") or [],
         "progress_percent": run.get("progress_percent") or 0,
         "current_message": run.get("current_message"),
+        "current_operation": run.get("current_operation")
+        or run.get("current_message"),
         "dem_mode": run.get("dem_mode"),
         "terrain_source": run.get("terrain_source") or run.get("dem_mode"),
+        "fill_missing_areas_with_satellite": bool(
+            run.get("fill_missing_with_satellite")),
         "analysis_version": run.get("analysis_version"),
         "has_dem": bool(run.get("dem_path")),
         "params": run.get("params_json") or {},
@@ -475,12 +521,17 @@ def _run_out(run: dict, *, full: bool = False) -> dict:
         "error_code": run.get("error_code"),
         "error_message": run.get("error_message"),
         "started_at": run.get("started_at"),
+        "stage_started_at": stage_started,
         "heartbeat_at": run.get("heartbeat_at"),
+        "last_heartbeat": run.get("heartbeat_at"),
+        "last_progress_at": last_prog,
         "updated_at": run.get("updated_at"),
         "created_at": run["created_at"],
         "completed_at": run.get("completed_at"),
         "elapsed_seconds": elapsed,
+        "stage_elapsed_seconds": stage_elapsed,
         "seconds_since_heartbeat": since_hb,
+        "seconds_since_progress": since_prog,
         "health": health,
         "health_message": prog.health_message(health, since_hb),
         "cancellable": run.get("state") in ("queued", "running")

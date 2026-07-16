@@ -170,6 +170,13 @@ def drone_only_min_aoi_coverage() -> float:
     return _float("DRONE_ONLY_MIN_AOI_COVERAGE", 0.98)
 
 
+def analysis_stage_timeout_seconds() -> int:
+    """Hard watchdog: a stage that reports no progress for this long is marked
+    stalled (failed) instead of running forever. Generous so a legitimately
+    heavy hydrology/fusion step is not killed prematurely."""
+    return _int("ANALYSIS_STAGE_TIMEOUT_SECONDS", 600)
+
+
 # --- jobs ----------------------------------------------------------------------
 
 def redis_url() -> str:

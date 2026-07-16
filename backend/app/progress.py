@@ -168,25 +168,34 @@ class ProgressReporter:
 
     def __init__(self, run_id: str, dem_mode: str = "auto",
                  rq_job_id: str | None = None,
-                 extra_progress: Callable[[str], None] | None = None):
+                 extra_progress: Callable[[str], None] | None = None,
+                 terrain_source: str | None = None,
+                 stage_timeout: int | None = None):
         self.run_id = run_id
         self._plan = build_stage_plan(dem_mode)
         self._completed: list[str] = []
         self._current: str | None = None
         self._last_percent = 0.0
         self._extra = extra_progress
+        # The user-selected provenance (e.g. existing_dtm). It is authoritative
+        # and must never be overwritten by mode resolution or coverage logic.
+        self._terrain_source = terrain_source
         self._lock = threading.Lock()
         self._hb_stop = threading.Event()
         self._hb_thread: threading.Thread | None = None
         self._interval = _heartbeat_interval()
+        self._stage_timeout = stage_timeout or _stage_timeout()
         worker = rq_job_id or os.environ.get("HOSTNAME") or "inline"
+        now = time.time()
         db.update_analysis_run(
             run_id, state="running", stage=QUEUED,
-            stage_label=stage_label(QUEUED), started_at=time.time(),
-            heartbeat_at=time.time(), stage_count=len(self._plan),
+            stage_label=stage_label(QUEUED), started_at=now,
+            heartbeat_at=now, stage_started_at=now, last_progress_at=now,
+            stage_count=len(self._plan),
             stage_index=0, progress_percent=0.0,
             stage_plan_json=self._plan, rq_job_id=rq_job_id,
-            worker_name=worker, terrain_source=None,
+            worker_name=worker, terrain_source=terrain_source,
+            current_operation=stage_label(QUEUED),
             analysis_version=ANALYSIS_VERSION, error_code=None,
             error_message=None)
 
@@ -217,11 +226,17 @@ class ProgressReporter:
     # -- mode / plan -------------------------------------------------------
     def set_mode(self, dem_mode: str, terrain_source: str | None = None) -> None:
         """Swap the stage plan to the resolved DEM mode. Completed stages are
-        preserved; progress stays monotonic."""
+        preserved; progress stays monotonic.
+
+        The user-selected ``terrain_source`` (set at construction) is never
+        clobbered here: the engine mode (drone_only/fused/…) is orthogonal to
+        provenance (existing_dtm/satellite/…). Only fall back to the mode as a
+        label when no provenance was supplied."""
         with self._lock:
             self._plan = build_stage_plan(dem_mode)
             self._completed = [s for s in self._completed if s in self._plan]
-            src = terrain_source or dem_mode
+            src = self._terrain_source or terrain_source or dem_mode
+            self._terrain_source = src
             db.update_analysis_run(
                 self.run_id, dem_mode=dem_mode, terrain_source=src,
                 stage_plan_json=self._plan, stage_count=len(self._plan))
@@ -238,11 +253,35 @@ class ProgressReporter:
                 self._completed.append(self._current)
             self._current = stage
             msg = message or stage_label(stage)
+            now = time.time()
+            db.update_analysis_run(self.run_id, stage_started_at=now,
+                                   last_progress_at=now,
+                                   current_operation=msg)
             self._recompute_locked(stage, message=msg)
         db.append_run_log(self.run_id, message or stage_label(stage),
                           stage=stage)
         if self._extra:
             self._extra(message or stage_label(stage))
+
+    def operation(self, message: str, percent: float | None = None) -> None:
+        """Fine-grained progress *inside* a stage (satellite download,
+        reprojection, resampling, clipping, fusion, …). Unlike a bare
+        heartbeat this advances ``last_progress_at`` — it is proof the work is
+        moving, which resets the stall watchdog. ``percent`` optionally nudges
+        the overall bar (bounded, never decreasing)."""
+        self._check_cancel()
+        fields = {"current_operation": message, "current_message": message,
+                  "last_progress_at": time.time(), "heartbeat_at": time.time()}
+        if percent is not None:
+            with self._lock:
+                pct = max(min(100.0, float(percent)), self._last_percent)
+                self._last_percent = pct
+                fields["progress_percent"] = pct
+        db.update_analysis_run(self.run_id, **fields)
+        db.append_run_log(self.run_id, message, level="debug",
+                          stage=self._current)
+        if self._extra:
+            self._extra(message)
 
     def complete_stage(self, stage: str, message: str | None = None) -> None:
         with self._lock:
@@ -327,11 +366,29 @@ class ProgressReporter:
                 run = db.get_analysis_run(self.run_id)
                 if run is None or run.get("state") in TERMINAL_STATES:
                     return
-                started = run.get("started_at") or time.time()
-                elapsed = int(time.time() - started)
-                db.update_analysis_run(self.run_id, heartbeat_at=time.time())
+                now = time.time()
+                # Watchdog: the worker is alive (this tick proves it), but if
+                # the *work* has reported no progress for the timeout window
+                # the stage is stuck — mark it stalled rather than run forever.
+                last_prog = run.get("last_progress_at") or run.get("started_at") or now
+                if now - last_prog > self._stage_timeout:
+                    db.update_analysis_run(
+                        self.run_id, state="failed", error_code="STAGE_STALLED",
+                        error_message=(
+                            f"The '{stage_label(self._current)}' stage made no "
+                            f"progress for {int(now - last_prog)}s and was "
+                            "marked stalled. Retry the analysis."),
+                        completed_at=now, heartbeat_at=now)
+                    db.append_run_log(
+                        self.run_id, f"STAGE_STALLED after "
+                        f"{int(now - last_prog)}s in {self._current}",
+                        level="error", stage=self._current)
+                    self._hb_stop.set()
+                    return
+                db.update_analysis_run(self.run_id, heartbeat_at=now)
                 log.debug("heartbeat run=%s stage=%s elapsed=%ss",
-                          self.run_id, self._current, elapsed)
+                          self.run_id, self._current,
+                          int(now - (run.get("started_at") or now)))
             except Exception:  # noqa: BLE001 — a heartbeat must never crash a run
                 log.debug("heartbeat tick failed for run %s", self.run_id,
                           exc_info=True)
@@ -354,6 +411,11 @@ def stale_warning_seconds() -> int:
 def stalled_seconds() -> int:
     from . import config
     return config._int("ANALYSIS_STALLED_SECONDS", 300)
+
+
+def _stage_timeout() -> int:
+    from . import config
+    return config.analysis_stage_timeout_seconds()
 
 
 # ---------------------------------------------------------------------------
