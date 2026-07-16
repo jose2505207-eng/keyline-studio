@@ -4,6 +4,10 @@ import sys
 # Tests must run offline: force the pure-Python hydrology engine so no
 # WhiteboxTools binary download is attempted.
 os.environ.setdefault("KEYLINE_HYDRO_ENGINE", "pysheds")
+# Deterministic queue behavior regardless of the host: point Redis at a
+# closed port so ANALYSIS_EXECUTION=auto always falls back to inline
+# execution unless a test monkeypatches get_queue explicitly.
+os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:1/0")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 

@@ -1,6 +1,8 @@
-"""SQLite-backed project + job store (no Redis/Celery — minimal infra).
+"""SQLite-backed store: projects, drone surveys, analysis runs, DTM library.
 
-Job states: queued | running:<step> | done | error:<message>
+Analysis-run states: queued | running | completed | completed_with_warnings
+| failed | cancelled. The `analysis_runs` row is the single source of truth
+for pipeline state; see app/progress.py for stage/heartbeat semantics.
 """
 
 from __future__ import annotations
@@ -73,40 +75,9 @@ def set_drone_path(pid: str, path: str) -> None:
         c.execute("UPDATE projects SET drone_path=? WHERE id=?", (path, pid))
 
 
-def create_job(pid: str) -> str:
-    jid = uuid.uuid4().hex[:12]
-    with _conn() as c:
-        c.execute(
-            "INSERT INTO jobs (id, project_id, state, updated_at) VALUES (?,?,?,?)",
-            (jid, pid, "queued", time.time()),
-        )
-    return jid
-
-
-def update_job(jid: str, state: str, log_line: str | None = None) -> None:
-    with _conn() as c:
-        if log_line is not None:
-            row = c.execute("SELECT log FROM jobs WHERE id=?", (jid,)).fetchone()
-            log = json.loads(row["log"]) if row else []
-            log.append({"t": time.time(), "msg": log_line})
-            c.execute("UPDATE jobs SET state=?, log=?, updated_at=? WHERE id=?",
-                      (state, json.dumps(log), time.time(), jid))
-        else:
-            c.execute("UPDATE jobs SET state=?, updated_at=? WHERE id=?",
-                      (state, time.time(), jid))
-
-
-def latest_job(pid: str) -> dict | None:
-    with _conn() as c:
-        row = c.execute(
-            "SELECT * FROM jobs WHERE project_id=? ORDER BY updated_at DESC LIMIT 1",
-            (pid,),
-        ).fetchone()
-    if row is None:
-        return None
-    d = dict(row)
-    d["log"] = json.loads(d["log"])
-    return d
+# The legacy `jobs` table remains in the schema (migrations never drop) but
+# is no longer written: analysis_runs is the single source of truth and the
+# legacy /status endpoint is derived from it.
 
 
 # ---------------------------------------------------------------------------
@@ -203,14 +174,18 @@ def _run_row_to_dict(row) -> dict:
 
 
 def create_analysis_run(project_id: str, survey_id: str | None,
-                        dem_path: str | None, params: dict) -> str:
+                        dem_path: str | None, params: dict,
+                        retry_of: str | None = None,
+                        retry_count: int = 0) -> str:
     rid = uuid.uuid4().hex[:12]
     now = time.time()
     with _conn() as c:
         c.execute(
             "INSERT INTO analysis_runs (id, project_id, survey_id, dem_path, "
-            "params_json, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-            (rid, project_id, survey_id, dem_path, json.dumps(params), now, now),
+            "params_json, retry_of, retry_count, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (rid, project_id, survey_id, dem_path, json.dumps(params),
+             retry_of, retry_count, now, now),
         )
     return rid
 
@@ -297,6 +272,42 @@ def run_cancel_requested(rid: str) -> bool:
     return bool(row and row["cancel_requested"])
 
 
+def active_run_for_project(pid: str) -> dict | None:
+    """The newest non-terminal analysis run for a project, if any. Used for
+    duplicate-start protection; staleness is judged by the caller."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM analysis_runs WHERE project_id=? AND "
+            "state IN ('queued','running') ORDER BY created_at DESC LIMIT 1",
+            (pid,)).fetchone()
+    return _run_row_to_dict(row) if row else None
+
+
+def sweep_stale_running_runs(stale_after: float) -> list[str]:
+    """Mark 'running' runs whose worker stopped heartbeating as failed
+    (WORKER_LOST) so they become retryable instead of running forever.
+    Returns the affected run ids. Safe to call from any process: the state
+    check and heartbeat cutoff are applied atomically in one UPDATE."""
+    now = time.time()
+    cutoff = now - stale_after
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id FROM analysis_runs WHERE state='running' AND "
+            "COALESCE(heartbeat_at, started_at, created_at) < ?",
+            (cutoff,)).fetchall()
+        ids = [r["id"] for r in rows]
+        if ids:
+            q = ",".join("?" for _ in ids)
+            c.execute(
+                f"UPDATE analysis_runs SET state='failed', "
+                "error_code='WORKER_LOST', error_message="
+                "'The analysis worker stopped reporting progress and is "
+                "presumed dead. Retry the analysis.', completed_at=?, "
+                f"updated_at=? WHERE id IN ({q}) AND state='running'",
+                [now, now, *ids])
+    return ids
+
+
 def claim_analysis_run(rid: str, worker: str, stale_after: float = 120.0) -> bool:
     """Atomically claim a run for one worker so a duplicate worker cannot
     process the same job. Succeeds only when the run is unclaimed, already
@@ -314,6 +325,92 @@ def claim_analysis_run(rid: str, worker: str, stale_after: float = 120.0) -> boo
             "  OR COALESCE(heartbeat_at, claimed_at, 0) < ?)",
             (worker, now, rid, worker, cutoff))
         return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Artifacts (durable records for every generated/ingested output file)
+
+_ARTIFACT_JSON_FIELDS = {"bounds_json", "resolution_json", "metadata_json"}
+
+
+def _artifact_row_to_dict(row) -> dict:
+    d = dict(row)
+    for f in _ARTIFACT_JSON_FIELDS:
+        if d.get(f) is not None:
+            try:
+                d[f] = json.loads(d[f])
+            except (TypeError, json.JSONDecodeError):
+                pass
+    return d
+
+
+def upsert_artifact(*, project_id: str, run_id: str | None,
+                    artifact_type: str, stored_path: str,
+                    original_filename: str | None = None,
+                    storage_provider: str = "filesystem",
+                    size_bytes: int | None = None,
+                    checksum_sha256: str | None = None,
+                    mime_type: str | None = None,
+                    crs: str | None = None,
+                    bounds: dict | list | None = None,
+                    resolution: list | None = None,
+                    width: int | None = None, height: int | None = None,
+                    band_count: int | None = None,
+                    nodata: float | None = None,
+                    elevation_min: float | None = None,
+                    elevation_max: float | None = None,
+                    algorithm_version: str | None = None,
+                    source_artifact_id: str | None = None,
+                    created_by: str | None = None,
+                    metadata: dict | None = None) -> str:
+    """Insert or refresh the artifact record for (run_id, artifact_type).
+
+    Regenerating an export replaces its record (same natural key) so a run
+    never lists two versions of the same product."""
+    now = time.time()
+    with _conn() as c:
+        row = None
+        if run_id is not None:
+            row = c.execute(
+                "SELECT id FROM artifacts WHERE run_id=? AND artifact_type=?",
+                (run_id, artifact_type)).fetchone()
+        aid = row["id"] if row else "art_" + uuid.uuid4().hex[:12]
+        c.execute(
+            "INSERT OR REPLACE INTO artifacts (id, project_id, run_id, "
+            "artifact_type, original_filename, stored_path, storage_provider, "
+            "size_bytes, checksum_sha256, mime_type, crs, bounds_json, "
+            "resolution_json, width, height, band_count, nodata, "
+            "elevation_min, elevation_max, algorithm_version, "
+            "source_artifact_id, created_by, metadata_json, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (aid, project_id, run_id, artifact_type, original_filename,
+             stored_path, storage_provider, size_bytes, checksum_sha256,
+             mime_type, crs,
+             json.dumps(bounds) if bounds is not None else None,
+             json.dumps(resolution) if resolution is not None else None,
+             width, height, band_count, nodata, elevation_min, elevation_max,
+             algorithm_version, source_artifact_id, created_by,
+             json.dumps(metadata or {}), now))
+    return aid
+
+
+def get_artifact(aid: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM artifacts WHERE id=?", (aid,)).fetchone()
+    return _artifact_row_to_dict(row) if row else None
+
+
+def list_artifacts(project_id: str, run_id: str | None = None) -> list[dict]:
+    with _conn() as c:
+        if run_id is not None:
+            rows = c.execute(
+                "SELECT * FROM artifacts WHERE project_id=? AND run_id=? "
+                "ORDER BY created_at DESC", (project_id, run_id)).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM artifacts WHERE project_id=? "
+                "ORDER BY created_at DESC", (project_id,)).fetchall()
+    return [_artifact_row_to_dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------

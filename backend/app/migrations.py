@@ -63,6 +63,25 @@ def _add_stage_progress_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE analysis_runs ADD COLUMN {name} {decl}")
 
 
+def _add_execution_columns(conn: sqlite3.Connection) -> None:
+    """Migration 6: one execution path for every analysis run.
+
+    ``executor`` records how the run was dispatched (rq | inline) so
+    operators can tell a queued-worker run from a dev-fallback run;
+    ``retry_of``/``retry_count`` link a retried run to the failed run it
+    replaces without ever mutating the original. Additive and idempotent."""
+    existing = {row[1] for row in
+                conn.execute("PRAGMA table_info(analysis_runs)").fetchall()}
+    columns = [
+        ("executor", "TEXT"),
+        ("retry_of", "TEXT"),
+        ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
+    ]
+    for name, decl in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE analysis_runs ADD COLUMN {name} {decl}")
+
+
 MIGRATIONS: list[tuple[int, Union[str, Callable[[sqlite3.Connection], None]]]] = [
     (
         1,
@@ -150,6 +169,43 @@ MIGRATIONS: list[tuple[int, Union[str, Callable[[sqlite3.Connection], None]]]] =
     ),
     (4, _add_analysis_progress_columns),
     (5, _add_stage_progress_columns),
+    (6, _add_execution_columns),
+    (
+        7,
+        """
+        CREATE TABLE IF NOT EXISTS artifacts (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            run_id TEXT,
+            artifact_type TEXT NOT NULL,
+            original_filename TEXT,
+            stored_path TEXT NOT NULL,
+            storage_provider TEXT NOT NULL DEFAULT 'filesystem',
+            size_bytes INTEGER,
+            checksum_sha256 TEXT,
+            mime_type TEXT,
+            crs TEXT,
+            bounds_json TEXT,
+            resolution_json TEXT,
+            width INTEGER,
+            height INTEGER,
+            band_count INTEGER,
+            nodata REAL,
+            elevation_min REAL,
+            elevation_max REAL,
+            algorithm_version TEXT,
+            source_artifact_id TEXT,
+            created_by TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id);
+        CREATE INDEX IF NOT EXISTS idx_artifacts_project
+            ON artifacts(project_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_run_type
+            ON artifacts(run_id, artifact_type);
+        """,
+    ),
 ]
 
 

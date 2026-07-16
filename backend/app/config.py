@@ -195,6 +195,27 @@ def redis_url() -> str:
     return os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 
+def analysis_execution() -> str:
+    """How terrain-analysis runs are executed:
+
+    * ``auto`` (default): enqueue to the RQ worker when Redis is reachable,
+      otherwise fall back to a supervised in-process execution (dev mode).
+    * ``rq``: RQ only — starting an analysis fails with 503 when the queue
+      is down (never silently computes inside the API process).
+    * ``inline``: always in-process (single-machine dev without Redis).
+    """
+    v = os.environ.get("ANALYSIS_EXECUTION", "auto").strip().lower()
+    return v if v in ("auto", "rq", "inline") else "auto"
+
+
+def analysis_worker_lost_seconds() -> int:
+    """A 'running' run whose heartbeat is older than this is presumed
+    orphaned (worker died without marking the run) and is swept to a
+    retryable failed/WORKER_LOST state. Must comfortably exceed the
+    heartbeat interval (15 s default)."""
+    return _int("ANALYSIS_WORKER_LOST_SECONDS", 300)
+
+
 # --- terrain QA ------------------------------------------------------------------
 
 def terrain_qa_mode() -> str:

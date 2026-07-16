@@ -71,6 +71,17 @@ def _startup():
         import logging
 
         logging.getLogger(__name__).warning("survey reconciliation failed: %s", exc)
+    # Analysis runs orphaned by a dead worker/API process become retryable
+    # instead of staying "running" forever.
+    try:
+        from . import config as _cfg
+
+        swept = db.sweep_stale_running_runs(_cfg.analysis_worker_lost_seconds())
+        if swept:
+            log.warning("startup recovery: %d orphaned analysis run(s) marked "
+                        "WORKER_LOST and retryable: %s", len(swept), swept)
+    except Exception as exc:  # noqa: BLE001 — startup must not die on this
+        log.warning("analysis-run reconciliation failed: %s", exc)
 
 
 from . import dtm_api, surveys_api  # noqa: E402
@@ -214,20 +225,85 @@ def _results_dir(pid: str) -> str:
     return project_dir(pid)
 
 
-def _run_job(jid: str, rid: str):
+def _run_inline(rid: str):
+    """Supervised in-process execution (dev fallback / ANALYSIS_EXECUTION=
+    inline). execute_analysis_run persists all state transitions itself;
+    exceptions are already recorded on the run — never re-raised into the
+    server loop."""
     from .jobs.terrain_job import execute_analysis_run
 
     try:
-        def progress(step: str):
-            db.update_job(jid, f"running:{step}", log_line=step)
+        execute_analysis_run(rid)
+    except (DemSourceError, ValueError, RuntimeError) as exc:
+        log.info("inline analysis run %s ended with error: %s", rid, exc)
+    except Exception:  # noqa: BLE001 — recorded on the run by the executor
+        log.exception("inline analysis run %s crashed", rid)
 
-        db.update_job(jid, "running:starting", log_line="starting")
-        execute_analysis_run(rid, extra_progress=progress)
-        db.update_job(jid, "done", log_line="done")
-    except (DemSourceError, ValueError) as exc:
-        db.update_job(jid, f"error:{exc}", log_line=str(exc))
-    except Exception as exc:  # noqa: BLE001 — surface anything to the job record
-        db.update_job(jid, f"error:internal error: {exc}", log_line=str(exc))
+
+def _dispatch_analysis(rid: str, background: BackgroundTasks) -> str:
+    """Send a queued analysis run to its executor and record which one.
+
+    Honors ANALYSIS_EXECUTION (auto | rq | inline). In ``rq`` mode a dead
+    queue fails the run with 503 rather than silently computing inside the
+    API process; ``auto`` falls back to the supervised inline thread so
+    single-machine dev keeps working without Redis."""
+    from . import config as cfg
+    from .jobs import QueueUnavailable, get_queue
+
+    mode = cfg.analysis_execution()
+    if mode in ("auto", "rq"):
+        try:
+            job = get_queue().enqueue("app.jobs.terrain_job.run_analysis_job",
+                                      rid, job_timeout=3600, result_ttl=86400)
+            fields = {"executor": "rq"}
+            job_id = getattr(job, "id", None)
+            if job_id:
+                fields["rq_job_id"] = job_id
+            db.update_analysis_run(rid, **fields)
+            return "rq"
+        except QueueUnavailable as exc:
+            if mode == "rq":
+                db.update_analysis_run(
+                    rid, state="failed", error_code="QUEUE_UNAVAILABLE",
+                    error_message=f"worker queue unavailable: {exc}")
+                raise HTTPException(503, f"Worker queue unavailable: {exc}")
+            log.warning("queue unavailable, executing run %s inline: %s",
+                        rid, exc)
+    db.update_analysis_run(rid, executor="inline")
+    background.add_task(_run_inline, rid)
+    return "inline"
+
+
+def _guard_duplicate_start(pid: str, force: bool) -> None:
+    """Refuse to start a second concurrent analysis for the same project.
+
+    Stale 'running' rows are swept to WORKER_LOST first, so only a genuinely
+    live run blocks. The active run id is returned in the 409 payload so the
+    client can attach to it instead of duplicating work."""
+    from . import config as cfg
+
+    db.sweep_stale_running_runs(cfg.analysis_worker_lost_seconds())
+    if force:
+        return
+    active = db.active_run_for_project(pid)
+    if active is None:
+        return
+    # A queued run that never reached a worker should not block forever:
+    # treat it as live only while young or while its RQ job still exists.
+    if active["state"] == "queued":
+        import time as _t
+
+        age = _t.time() - active["created_at"]
+        rq_status = _rq_job_status(active.get("rq_job_id"))
+        if age > 300 and rq_status in (None, "missing"):
+            db.update_analysis_run(
+                active["id"], state="failed", error_code="QUEUE_LOST",
+                error_message="The queued analysis never reached a worker. "
+                              "It was superseded by a newer run.")
+            return
+    raise HTTPException(409, {
+        "message": "An analysis is already in progress for this project.",
+        "active_run_id": active["id"], "state": active["state"]})
 
 
 def _terrain_source_for(dtm: dict | None, dem_path: str | None) -> str:
@@ -248,6 +324,9 @@ class AnalyzeIn(BaseModel):
     # Existing-DTM analysis never touches Copernicus unless this is explicitly
     # enabled; a partially-covering DTM otherwise stops with a coverage error.
     fill_missing_areas_with_satellite: bool = False
+    # Start even when another run is active (the active run keeps running;
+    # normally the client should attach to the 409-reported active run).
+    force: bool = False
 
 
 @app.post("/api/projects/{pid}/analyze")
@@ -279,8 +358,8 @@ def analyze(pid: str, background: BackgroundTasks,
                 422, f"dem_mode={body.dem_mode} requires a DTM — select or "
                      "upload one first")
 
+    _guard_duplicate_start(pid, body.force)
     terrain_source = _terrain_source_for(dtm, dem_path)
-    jid = db.create_job(pid)
     rid = db.create_analysis_run(pid, survey_id, dem_path,
                                  {"trigger": "analyze",
                                   "dem_mode": body.dem_mode,
@@ -289,17 +368,38 @@ def analyze(pid: str, background: BackgroundTasks,
                                   "terrain_source": terrain_source,
                                   "fill_missing_areas_with_satellite":
                                       body.fill_missing_areas_with_satellite})
-    background.add_task(_run_job, jid, rid)
-    return {"job_id": jid, "run_id": rid}
+    executor = _dispatch_analysis(rid, background)
+    return {"run_id": rid, "state": "queued", "executor": executor,
+            # legacy alias kept for older clients that keyed on job_id
+            "job_id": rid}
 
 
 @app.get("/api/projects/{pid}/status")
 def status(pid: str):
+    """Legacy status shape (queued | running:<stage> | done | error:<msg>),
+    now derived from the authoritative analysis_runs record instead of the
+    retired jobs table."""
+    from . import config as cfg
+
     _require_project(pid)
-    job = db.latest_job(pid)
-    if job is None:
+    db.sweep_stale_running_runs(cfg.analysis_worker_lost_seconds())
+    runs = db.list_analysis_runs(pid)
+    if not runs:
         return {"state": "none", "log": []}
-    return {"job_id": job["id"], "state": job["state"], "log": job["log"]}
+    run = runs[0]
+    state = run["state"]
+    if state in ("completed", "completed_with_warnings"):
+        legacy = "done"
+    elif state == "queued":
+        legacy = "queued"
+    elif state == "running":
+        legacy = f"running:{run.get('stage') or 'starting'}"
+    else:  # failed / cancelled
+        legacy = f"error:{run.get('error_message') or state}"
+    log_entries = [{"t": e.get("t"), "msg": e.get("msg")}
+                   for e in (run.get("log_json") or [])]
+    return {"job_id": run["id"], "run_id": run["id"], "state": legacy,
+            "log": log_entries}
 
 
 @app.get("/api/projects/{pid}/results")
@@ -357,10 +457,11 @@ class ReanalyzeIn(BaseModel):
     dem_mode: str = "auto"
     terrain: dict | None = None    # advanced terrain parameters (whitelisted)
     fill_missing_areas_with_satellite: bool = False
+    force: bool = False
 
 
 @app.post("/api/projects/{pid}/reanalyze")
-def reanalyze(pid: str, body: ReanalyzeIn):
+def reanalyze(pid: str, body: ReanalyzeIn, background: BackgroundTasks):
     """Re-run terrain analysis with the existing validated drone DTM and the
     current AOI. Photographs are never resubmitted to the processing node;
     a new analysis run is created and previous runs are preserved."""
@@ -407,6 +508,7 @@ def reanalyze(pid: str, body: ReanalyzeIn):
                      if r.get("terrain_source")), None)
         terrain_source = prev or _terrain_source_for(None, dem_path)
 
+    _guard_duplicate_start(pid, body.force)
     rid = db.create_analysis_run(pid, survey_id, dem_path,
                                  {"trigger": "reanalyze",
                                   "dem_mode": body.dem_mode,
@@ -415,16 +517,8 @@ def reanalyze(pid: str, body: ReanalyzeIn):
                                   "terrain_source": terrain_source,
                                   "fill_missing_areas_with_satellite":
                                       body.fill_missing_areas_with_satellite})
-    from .jobs import QueueUnavailable, get_queue
-
-    try:
-        get_queue().enqueue("app.jobs.terrain_job.run_analysis_job", rid,
-                            job_timeout=3600, result_ttl=86400)
-    except QueueUnavailable as exc:
-        db.update_analysis_run(rid, state="failed",
-                               error_message=f"worker queue unavailable: {exc}")
-        raise HTTPException(503, str(exc))
-    return {"run_id": rid, "state": "queued",
+    executor = _dispatch_analysis(rid, background)
+    return {"run_id": rid, "state": "queued", "executor": executor,
             "dem_path": bool(dem_path), "survey_id": survey_id}
 
 
@@ -536,6 +630,10 @@ def _run_out(run: dict, *, full: bool = False) -> dict:
         "health_message": prog.health_message(health, since_hb),
         "cancellable": run.get("state") in ("queued", "running")
         and not run.get("cancel_requested"),
+        "retryable": run.get("state") in ("failed", "cancelled"),
+        "executor": run.get("executor"),
+        "retry_of": run.get("retry_of"),
+        "retry_count": run.get("retry_count") or 0,
         "worker": {"rq_job_id": run.get("rq_job_id"),
                    "status": worker_status,
                    "worker_name": run.get("worker_name")},
@@ -552,7 +650,10 @@ def _no_store(payload: dict) -> JSONResponse:
 
 @app.get("/api/projects/{pid}/analysis-runs")
 def list_analysis_runs(pid: str):
+    from . import config as cfg
+
     _require_project(pid)
+    db.sweep_stale_running_runs(cfg.analysis_worker_lost_seconds())
     return _no_store({"runs": [_run_out(r) for r in db.list_analysis_runs(pid)]})
 
 
@@ -566,8 +667,28 @@ def _require_run(pid: str, rid: str) -> dict:
 
 @app.get("/api/projects/{pid}/analysis-runs/{rid}")
 def get_analysis_run(pid: str, rid: str):
+    from . import config as cfg
+
+    db.sweep_stale_running_runs(cfg.analysis_worker_lost_seconds())
     run = _require_run(pid, rid)
     return _no_store(_run_out(run, full=True))
+
+
+@app.get("/api/projects/{pid}/analysis-runs/{rid}/events")
+async def analysis_run_events(pid: str, rid: str):
+    """Live progress as Server-Sent Events. Pushes a `run` event on every
+    meaningful change (stage, progress, message, warnings, health), comment
+    keepalives in between, and an `end` event at terminal state. Polling
+    GET /analysis-runs/{rid} remains the fallback and shows the same truth."""
+    from fastapi.responses import StreamingResponse
+
+    from .events import run_event_stream
+
+    _require_run(pid, rid)
+    return StreamingResponse(
+        run_event_stream(pid, rid, serialize=_run_out),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/projects/{pid}/analysis-runs/{rid}/cancel")
@@ -588,6 +709,55 @@ def cancel_analysis_run(pid: str, rid: str):
         except Exception:  # noqa: BLE001 — cooperative flag is the real signal
             pass
     return _no_store({"ok": True, "state": "cancelling"})
+
+
+@app.post("/api/projects/{pid}/analysis-runs/{rid}/retry")
+def retry_analysis_run(pid: str, rid: str, background: BackgroundTasks):
+    """Retry a failed/cancelled/stalled run as a *new* run with the same
+    parameters. The original run row is never mutated (except a stale
+    'running' row being honestly swept to WORKER_LOST first), so a previous
+    successful run can never be overwritten by a retry."""
+    from . import config as cfg
+
+    db.sweep_stale_running_runs(cfg.analysis_worker_lost_seconds())
+    run = _require_run(pid, rid)
+    if run["state"] in ("completed", "completed_with_warnings"):
+        raise HTTPException(409, "Run already completed successfully — use "
+                                 "re-run to analyze again")
+    if run["state"] in ("queued", "running"):
+        # only a provably dead queued run may be superseded by a retry
+        rq_status = _rq_job_status(run.get("rq_job_id"))
+        age = __import__("time").time() - run["created_at"]
+        if run["state"] == "queued" and age > 60 and \
+                rq_status in (None, "missing"):
+            db.update_analysis_run(
+                rid, state="failed", error_code="QUEUE_LOST",
+                error_message="The queued analysis never reached a worker.")
+        else:
+            raise HTTPException(409, "Run is still active — cancel it first "
+                                     "or wait for it to finish")
+
+    params = dict(run.get("params_json") or {})
+    dem_path = run.get("dem_path")
+    # Re-validate the DTM reference so a retry can never queue against a
+    # file that has vanished since the original run.
+    if params.get("dtm_id"):
+        from .dtm_api import resolve_dtm_for_analysis
+
+        _, dem_path = resolve_dtm_for_analysis(params["dtm_id"])
+    elif dem_path and not os.path.isfile(dem_path):
+        raise HTTPException(
+            422, "The original DTM file for this run is no longer available "
+                 "— select or upload a DTM and start a new analysis")
+    params["trigger"] = "retry"
+    params["retry_of"] = rid
+    new_rid = db.create_analysis_run(
+        pid, run.get("survey_id"), dem_path, params,
+        retry_of=rid, retry_count=int(run.get("retry_count") or 0) + 1)
+    executor = _dispatch_analysis(new_rid, background)
+    log.info("retry run=%s -> new run=%s executor=%s", rid, new_rid, executor)
+    return _no_store({"run_id": new_rid, "retry_of": rid, "state": "queued",
+                      "executor": executor})
 
 
 @app.post("/api/projects/{pid}/analysis-runs/{rid}/regenerate-exports")
